@@ -1,0 +1,1562 @@
+@echo off
+chcp 65001 >nul
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
+setlocal EnableExtensions EnableDelayedExpansion
+
+REM OCR throughput tuning (can be overridden by user env vars)
+if not defined PADDLE_OCR_USE_ANGLE_CLS set "PADDLE_OCR_USE_ANGLE_CLS=0"
+if not defined PADDLE_OCR_CPU_THREADS set "PADDLE_OCR_CPU_THREADS=4"
+if not defined PADDLE_OCR_BATCH_SIZE set "PADDLE_OCR_BATCH_SIZE=8"
+if not defined PADDLE_OCR_WARMUP set "PADDLE_OCR_WARMUP=1"
+if not defined DOCX_SEMANTIC_MAX_CANDIDATES set "DOCX_SEMANTIC_MAX_CANDIDATES=180"
+
+set "RUN_LOG=%~dp0run_full_kb_pipeline.log"
+> "%RUN_LOG%" echo [INFO] %DATE% %TIME% startup
+>> "%RUN_LOG%" echo [DEBUG] Script Started
+
+REM One-shot interactive pipeline:
+REM   1) DOCX to knowledge_base.json
+REM   2) PDF to pages/*.png
+REM   3) Crop tables/legends to shots/ + manifest.json
+REM   4) Merge manifest into knowledge_base.json
+REM
+REM Usage:
+REM   tools\run_full_kb_pipeline.cmd
+REM   tools\run_full_kb_pipeline.cmd "FILE_ID" "DOCX_PATH" "PDF_PATH"
+REM   tools\run_full_kb_pipeline.cmd "FILE_ID" "DOCX_PATH" "PDF_PATH" "CLEANUP_FLAG" "PDF_MODE"
+REM
+REM PDF_MODE:
+REM   auto (default): keep current behavior (prefer native, fallback when needed)
+REM   gpu          : force PDF-native path; do not fallback to legacy CPU path
+REM   cpu          : force legacy CPU path (export pages + crop + merge)
+REM   visual       : DOCX text + PDF visual-only path (skip DOCX table image export, then run legacy Step2/3)
+
+set "REPO_ROOT=%~dp0.."
+set "SCRIPT_DIR=%~dp0"
+set "PDF_PROGRESS_RUNNER=%SCRIPT_DIR%..\scripts\utils\run_pdf_native_with_progress.py"
+for %%I in ("%REPO_ROOT%") do set "REPO_ROOT=%%~fI"
+
+REM Prefer latest repo script for Step 1 when available.
+set "LATEST_REPO=C:\Users\zgz31\AndroidStudioProjects\PowerAi"
+if defined POWERAI_REPO_ROOT set "LATEST_REPO=%POWERAI_REPO_ROOT%"
+if exist "%LATEST_REPO%\build.gradle.kts" set "REPO_ROOT=%LATEST_REPO%"
+set "ASSETS_KB_ROOT=%REPO_ROOT%\app\src\main\assets\kb"
+set "BUILD_KB_SCRIPT=%SCRIPT_DIR%build_kb_from_docx.py"
+if defined POWERAI_BUILD_KB_SCRIPT if exist "%POWERAI_BUILD_KB_SCRIPT%" set "BUILD_KB_SCRIPT=%POWERAI_BUILD_KB_SCRIPT%"
+if not exist "%BUILD_KB_SCRIPT%" if exist "%LATEST_REPO%\tools\build_kb_from_docx.py" set "BUILD_KB_SCRIPT=%LATEST_REPO%\tools\build_kb_from_docx.py"
+
+if not defined TESSERACT_CMD (
+  if exist "C:\Program Files\Tesseract-OCR\tesseract.exe" set "TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+if not defined TESSERACT_CMD (
+  if exist "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe" set "TESSERACT_CMD=C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"
+)
+
+set "PYEXE=python"
+call :SET_PYEXE_IF_EXISTS "%POWERAI_PYEXE%"
+call :SET_PYEXE_IF_EXISTS "%SCRIPT_DIR%..\.venv\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%SCRIPT_DIR%..\.venv3.11\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%SCRIPT_DIR%..\.venv_ocr\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%SCRIPT_DIR%..\venv\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%REPO_ROOT%\.venv\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%REPO_ROOT%\.venv3.11\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%REPO_ROOT%\.venv_ocr\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%REPO_ROOT%\venv\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%LATEST_REPO%\.venv\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%LATEST_REPO%\.venv3.11\Scripts\python.exe"
+call :SET_PYEXE_IF_EXISTS "%LATEST_REPO%\.venv_ocr\Scripts\python.exe"
+set "PDF_NATIVE_PYEXE=%PYEXE%"
+call :LOG [INFO] Selected Python interpreter: %PYEXE%
+
+REM Try to auto-activate a repository virtualenv so users don't need to do it manually.
+set "VENV_ACTIVATED=0"
+set "VENV_ACTIVATED_PATH="
+call :TRY_ACTIVATE_VENV "%SCRIPT_DIR%..\.venv\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%SCRIPT_DIR%..\.venv3.11\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%SCRIPT_DIR%..\.venv_ocr\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%SCRIPT_DIR%..\venv\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%REPO_ROOT%\.venv\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%REPO_ROOT%\.venv3.11\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%REPO_ROOT%\.venv_ocr\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%REPO_ROOT%\venv\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%LATEST_REPO%\.venv\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%LATEST_REPO%\.venv3.11\Scripts\activate.bat"
+call :TRY_ACTIVATE_VENV "%LATEST_REPO%\.venv_ocr\Scripts\activate.bat"
+if "%VENV_ACTIVATED%"=="1" (
+  call :LOG [INFO] Activated repository virtual environment: %VENV_ACTIVATED_PATH%
+) else (
+  call :LOG [WARN] No activate.bat found for repo virtualenvs; continuing without activation.
+)
+
+set "FILE_ID=%~1"
+set "DOCX=%~2"
+set "PDF=%~3"
+set "CLEANUP_FLAG=%~4"
+set "PDF_PIPELINE_MODE=%~5"
+set "PDF_MODE_USER_SET=0"
+
+call :LOG [DBG] incoming args: %*
+call :LOG [DBG] FILE_ID="%FILE_ID%" DOCX="%DOCX%" PDF="%PDF%"
+
+set "INTERACTIVE=0"
+if "%~1"=="" set "INTERACTIVE=1"
+if "%~2"=="" set "INTERACTIVE=1"
+if "%~3"=="" set "INTERACTIVE=1"
+
+set "RC=0"
+set "FAILED_STEP="
+set "RUN_MODE=unknown"
+set "FLOW_DOCX=SKIPPED"
+set "FLOW_PDF=SKIPPED"
+set "FLOW_POST=SKIPPED"
+set "FLOW_ALIGN=SKIPPED"
+set "KB_EXISTS=NO"
+set "KB_ULTRA_EXISTS=NO"
+set "ALIGN_EXISTS=NO"
+set "SHOT_COUNT=0"
+set "DEEPSEEK_ROWS=0"
+set "CHANGED_ROWS=0"
+set "DEEPSEEK_EFFECTIVE_ROWS=0"
+set "CHANGED_EFFECTIVE_ROWS=0"
+set "DEEPSEEK_CLIENT_NOT_CONFIGURED_ROWS=0"
+set "DEEPSEEK_UNCHANGED_STATUS_ROWS=0"
+set "DEEPSEEK_STATUS=UNKNOWN"
+set "DEEPSEEK_CONFIGURED=NO"
+set "DOCX_CORRECTION_ROWS=0"
+set "DOCX_ROUTE=unknown"
+set "DOCX_QUALITY=unknown"
+set "PDF_TEXT_PROFILE=unknown"
+set "ROUTE_REASON="
+set "ROUTE_HINT_PDF_MODE="
+set "SKIP_DOCX_HINT=0"
+set "SKIP_DOCX_PENDING_HINT=0"
+set "DOCX_SEMANTIC_CORRECTION=0"
+set "DOCX_SUSPICIOUS_RATIO=0.0000"
+set "PDF_NATIVE_RATIO=0.0000"
+set "OCR_BACKEND=UNKNOWN"
+set "OCR_GPU_REQUESTED=NO"
+set "OCR_GPU_AVAILABLE=NO"
+set "OCR_FALLBACK_OCCURRED=NO"
+set "PDF_NATIVE_TMP_KB="
+
+set "KB_PREFIX="
+
+if not defined FILE_ID set /p FILE_ID=请输入 taxonomy fileId，直接回车或输入 auto 表示从 DOCX 文件名自动生成: 
+if not defined DOCX set /p DOCX=请输入 DOCX 文件路径: 
+if not defined PDF set /p PDF=请输入 PDF 文件路径（可为空；为空或输入 ./- 将跳过 PDF 相关流程）: 
+
+REM Users often paste paths with surrounding quotes; strip them to avoid exist-check failures.
+if defined FILE_ID set "FILE_ID=%FILE_ID:"=%"
+if defined DOCX set "DOCX=%DOCX:"=%"
+if defined PDF set "PDF=%PDF:"=%"
+if defined PDF_PIPELINE_MODE set "PDF_PIPELINE_MODE=%PDF_PIPELINE_MODE:"=%"
+if defined PDF_PIPELINE_MODE if /I not "%PDF_PIPELINE_MODE%"=="auto" set "PDF_MODE_USER_SET=1"
+
+REM Allow skipping PDF-related steps by leaving it blank or using '.'/'-'
+if defined PDF (
+  if "%PDF%"=="." set "PDF="
+  if "%PDF%"=="./" set "PDF="
+  if "%PDF%"==".\" set "PDF="
+  if "%PDF%"=="-" set "PDF="
+)
+
+REM Allow skipping DOCX-related steps by using '.' or '-'
+if defined DOCX (
+  if "%DOCX%"=="." set "DOCX="
+  if "%DOCX%"=="-" set "DOCX="
+)
+
+REM Normalize input file paths before changing working directory with pushd.
+if defined DOCX call :TO_ABS_PATH "%DOCX%" DOCX
+if defined PDF call :TO_ABS_PATH "%PDF%" PDF
+
+REM UX hardening: users often paste a PDF path into the DOCX prompt.
+REM Auto-correct to PDF-only flow to avoid accidentally running DOCX+PDF legacy steps.
+set "DOCX_EXT="
+set "PDF_EXT_INPUT="
+if defined DOCX for %%F in ("%DOCX%") do set "DOCX_EXT=%%~xF"
+if defined PDF for %%F in ("%PDF%") do set "PDF_EXT_INPUT=%%~xF"
+if /I "%DOCX_EXT%"==".pdf" (
+  if not defined PDF (
+    call echo [INFO] 检测到 DOCX 输入为 PDF，已自动切换到 PDF-only 模式。
+    set "PDF=%DOCX%"
+    set "DOCX="
+  ) else (
+    if /I "%PDF_EXT_INPUT%"==".pdf" (
+      call echo [WARN] DOCX 输入为 PDF，将忽略 DOCX，仅使用 PDF 参数运行。
+      set "DOCX="
+    )
+  )
+)
+
+if not defined FILE_ID set "FILE_ID=auto"
+
+set "SKIP_DOCX=0"
+if not defined DOCX (
+  if defined PDF (
+    call echo [WARN] 未提供 DOCX，已提供 PDF；将从 PDF 文件名推导 fileId，并跳过 DOCX to knowledge_base 步骤。
+    set "SKIP_DOCX=1"
+  ) else (
+    echo.
+    call echo [ERROR] DOCX not found: "%DOCX%"
+    set "RC=2"
+    set "FAILED_STEP=input"
+    goto END
+  )
+) else (
+  if not exist "%DOCX%" (
+      if defined PDF (
+      call echo [WARN] 指定的 DOCX 路径不存在，但提供了 PDF；将从 PDF 文件名推导 fileId，并跳过 DOCX to knowledge_base 步骤。
+      set "SKIP_DOCX=1"
+    ) else (
+      echo.
+      call echo [ERROR] DOCX not found: "%DOCX%"
+      set "RC=2"
+      set "FAILED_STEP=input"
+      goto END
+    )
+  )
+)
+
+if defined PDF (
+  if not exist "%PDF%" (
+    echo.
+    call echo [ERROR] PDF not found: "%PDF%"
+    set "RC=2"
+    set "FAILED_STEP=input"
+    goto END
+  )
+)
+
+call :AUTO_ROUTE_DOCX_PDF
+
+REM Optional taxonomy wizard: pick output prefix like 铁路/规章制度/电力
+if /I "%FILE_ID%"=="auto" if "%INTERACTIVE%"=="1" goto ASK_PREFIX_WIZARD
+goto AFTER_PREFIX_WIZARD
+
+:ASK_PREFIX_WIZARD
+set "WANT_PREFIX="
+set /p WANT_PREFIX=是否使用分类向导选择输出目录前缀 y/N: 
+if defined WANT_PREFIX set "WANT_PREFIX=%WANT_PREFIX:"=%"
+if /I "%WANT_PREFIX%"=="y" (
+  if not defined DOCX (
+    if defined PDF (
+      rem If DOCX is not provided but PDF is, use PDF as the derive source so pick_kb_prefix/derive can operate
+      set "DOC_FOR_DERIVE=%PDF%"
+    )
+  )
+  call :PICK_PREFIX
+  if errorlevel 1 (
+    set "RC=2"
+    set "FAILED_STEP=pick-prefix"
+    goto END
+  )
+)
+
+:AFTER_PREFIX_WIZARD
+
+call :LOG [DBG] AFTER_PREFIX_WIZARD: FILE_ID="%FILE_ID%" SKIP_DOCX="%SKIP_DOCX%" DOC_FOR_DERIVE="%DOC_FOR_DERIVE%"
+
+REM Auto-derive fileId from DOCX/PDF filename when blank/auto is used.
+if /I "%FILE_ID%"=="auto" (
+  call :LOG [DBG] inside auto block
+  set "DERIVE_ERROR=0"
+  set "DERIVE_ERROR_MSG="
+  set "DOC_FOR_DERIVE="
+  set "DERIVE_SRC="
+
+  rem Determine source file for derive (DOCX preferred, fallback to PDF)
+  if "%SKIP_DOCX%"=="1" (
+    if defined PDF (
+      set "DOC_FOR_DERIVE=!PDF!"
+      set "DERIVE_SRC=!PDF!"
+    ) else (
+      set "DERIVE_ERROR=1"
+      set "DERIVE_ERROR_MSG=SKIP_DOCX=1 but no PDF provided; cannot derive fileId"
+    )
+  ) else (
+    if not defined DOCX (
+      if defined PDF (
+        set "DOC_FOR_DERIVE=!PDF!"
+        set "DERIVE_SRC=!PDF!"
+      ) else (
+        set "DERIVE_ERROR=1"
+        set "DERIVE_ERROR_MSG=DOCX not provided and no PDF; cannot derive fileId"
+      )
+    ) else (
+      rem DOCX provided — use DOCX as source for derive
+      set "DOC_FOR_DERIVE=!DOCX!"
+      set "DERIVE_SRC=!DOCX!"
+    )
+  )
+)
+
+rem Abort if we flagged an error during simple derivation
+if "%DERIVE_ERROR%"=="1" (
+  echo.
+  echo [ERROR] %DERIVE_ERROR_MSG%
+  call :LOG [ERROR] %DERIVE_ERROR_MSG%
+  set "RC=2"
+  set "FAILED_STEP=derive-fileId"
+  goto END
+)
+
+rem If still in auto mode (we didn't set FILE_ID), extract basename from DERIVE_SRC via a subroutine (outside of parentheses)
+if /I "%FILE_ID%"=="auto" (
+  if defined KB_PREFIX (
+    call :DERIVE_FILE_ID
+    if errorlevel 1 (
+      set "FILE_ID=Railway_Power_Standard"
+      call :LOG [WARN] derive_file_id with prefix failed for !DERIVE_SRC!; falling back to FILE_ID=!FILE_ID!
+    )
+  ) else (
+    if defined DERIVE_SRC (
+      call :GET_BASENAME "!DERIVE_SRC!"
+      if errorlevel 1 (
+        rem If basename extraction failed, fallback to a safe default to avoid abort
+        set "FILE_ID=Railway_Power_Standard"
+        call :LOG [WARN] Basename extraction failed for !DERIVE_SRC!; falling back to FILE_ID=!FILE_ID!
+      )
+    ) else (
+      rem Final fallback when no derive source is available
+      set "FILE_ID=Railway_Power_Standard"
+      call :LOG [WARN] No DERIVE_SRC available; falling back to FILE_ID=!FILE_ID!
+    )
+  )
+)
+
+call :LOG [DBG] after derive-fileId FILE_ID="%FILE_ID%"
+
+if not defined FILE_ID (
+  echo.
+  call echo [ERROR] Failed to derive fileId.
+  set "RC=2"
+  set "FAILED_STEP=derive-fileId"
+  goto END
+)
+
+set "CROP_EXTRA="
+set "PDF_NATIVE_EXTRA="
+set "PAGE_MATCH=best"
+set "SCOPE_UNIT="
+set "DEBUG_MERGE=0"
+set "CLEANUP=1"
+if not defined PDF_PIPELINE_MODE set "PDF_PIPELINE_MODE=auto"
+
+set "DEFAULT_YOLO_LAYOUT_MODEL=%SCRIPT_DIR%..\layout\yolov10s_best.pt\yolov10s_best.pt"
+if defined KB_YOLO_LAYOUT_MODEL set "DEFAULT_YOLO_LAYOUT_MODEL=%KB_YOLO_LAYOUT_MODEL%"
+if /I not "%KB_DISABLE_YOLO_LAYOUT%"=="1" (
+  if exist "%DEFAULT_YOLO_LAYOUT_MODEL%" (
+    set "PDF_NATIVE_EXTRA=--layout-engine auto --yolo-layout-model ""%DEFAULT_YOLO_LAYOUT_MODEL%"""
+  )
+)
+if defined KB_PDF_NATIVE_EXTRA set "PDF_NATIVE_EXTRA=%KB_PDF_NATIVE_EXTRA%"
+
+REM Non-interactive cleanup flag (4th arg): y/yes/1/clean/cleanup
+if defined CLEANUP_FLAG (
+  set "CLEANUP_FLAG=%CLEANUP_FLAG:"=%"
+  if /I "%CLEANUP_FLAG%"=="y" set "CLEANUP=1"
+  if /I "%CLEANUP_FLAG%"=="yes" set "CLEANUP=1"
+  if /I "%CLEANUP_FLAG%"=="1" set "CLEANUP=1"
+  if /I "%CLEANUP_FLAG%"=="clean" set "CLEANUP=1"
+  if /I "%CLEANUP_FLAG%"=="cleanup" set "CLEANUP=1"
+  if /I "%CLEANUP_FLAG%"=="n" set "CLEANUP=0"
+  if /I "%CLEANUP_FLAG%"=="no" set "CLEANUP=0"
+  if /I "%CLEANUP_FLAG%"=="0" set "CLEANUP=0"
+  if /I "%CLEANUP_FLAG%"=="keep" set "CLEANUP=0"
+)
+
+if not "%INTERACTIVE%"=="1" goto AFTER_INTERACTIVE_PROMPTS
+
+set "CROP_EXTRA_IN="
+set /p CROP_EXTRA_IN=裁剪附加参数，默认无。直接回车跳过。输入 debug 表示启用 --debug，也可直接填写自定义参数: 
+if defined CROP_EXTRA_IN set "CROP_EXTRA_IN=%CROP_EXTRA_IN:"=%"
+if defined CROP_EXTRA_IN (
+  if "%CROP_EXTRA_IN%"=="." (
+    set "CROP_EXTRA="
+  ) else (
+    if /I "%CROP_EXTRA_IN%"=="debug" (
+      set "CROP_EXTRA=--debug"
+    ) else (
+      if /I "%CROP_EXTRA_IN%"=="--debug" (
+        set "CROP_EXTRA=--debug"
+      ) else (
+        set "CROP_EXTRA=%CROP_EXTRA_IN%"
+      )
+    )
+  )
+)
+
+set "PAGE_MATCH_IN="
+set /p PAGE_MATCH_IN=合并匹配模式 page-match，输入 best 或 all。直接回车用 best: 
+if defined PAGE_MATCH_IN set "PAGE_MATCH_IN=%PAGE_MATCH_IN:"=%"
+if defined PAGE_MATCH_IN (
+  if /I "%PAGE_MATCH_IN%"=="best" (
+    set "PAGE_MATCH=best"
+  ) else (
+    if /I "%PAGE_MATCH_IN%"=="all" (
+      set "PAGE_MATCH=all"
+    ) else (
+      if /I "%PAGE_MATCH_IN%"=="n" (
+        set "PAGE_MATCH=best"
+      ) else (
+        if /I "%PAGE_MATCH_IN%"=="no" (
+          set "PAGE_MATCH=best"
+        ) else (
+          echo.
+          call echo [WARN] page-match 输入无效，已按默认 best 处理: "%PAGE_MATCH_IN%"
+          set "PAGE_MATCH=best"
+        )
+      )
+    )
+  )
+)
+
+set "SCOPE_UNIT="
+set "SCOPE_WANT="
+set /p SCOPE_WANT=是否只合并单位名包含某个关键词的条目 y/N: 
+if defined SCOPE_WANT set "SCOPE_WANT=%SCOPE_WANT:"=%"
+if /I "%SCOPE_WANT%"=="y" (
+  set /p SCOPE_UNIT=请输入单位名关键词，直接回车表示不限定: 
+) else (
+  REM 兼容老用法：如果用户直接粘贴了关键词而不是输入 y/N，则把它当作关键词。
+  if defined SCOPE_WANT (
+    if /I not "%SCOPE_WANT%"=="n" (
+      if /I not "%SCOPE_WANT%"=="no" (
+        set "SCOPE_UNIT=%SCOPE_WANT%"
+      )
+    )
+  )
+)
+
+set "DEBUG_MERGE_IN="
+set /p DEBUG_MERGE_IN=合并阶段输出调试日志 y/N: 
+if defined DEBUG_MERGE_IN set "DEBUG_MERGE_IN=%DEBUG_MERGE_IN:"=%"
+if /I "%DEBUG_MERGE_IN%"=="y" set "DEBUG_MERGE=1"
+if /I "%DEBUG_MERGE_IN%"=="yes" set "DEBUG_MERGE=1"
+
+set "CLEANUP_IN="
+set /p CLEANUP_IN=成功后自动清理临时产物，仅保留 knowledge_base.json 和 截图（默认 Y，输入 n 保留）: 
+if defined CLEANUP_IN set "CLEANUP_IN=%CLEANUP_IN:"=%"
+if /I "%CLEANUP_IN%"=="n" set "CLEANUP=0"
+if /I "%CLEANUP_IN%"=="no" set "CLEANUP=0"
+
+set "PDF_MODE_IN="
+set /p PDF_MODE_IN=PDF 提取模式（auto/gpu/cpu/visual，默认 auto）: 
+if defined PDF_MODE_IN (
+  set "PDF_MODE_IN=%PDF_MODE_IN:"=%"
+  set "PDF_PIPELINE_MODE=%PDF_MODE_IN%"
+  if /I not "%PDF_MODE_IN%"=="auto" set "PDF_MODE_USER_SET=1"
+)
+
+:AFTER_INTERACTIVE_PROMPTS
+
+if not defined PDF_PIPELINE_MODE set "PDF_PIPELINE_MODE=auto"
+if "%PDF_MODE_USER_SET%"=="0" if defined ROUTE_HINT_PDF_MODE if /I "%PDF_PIPELINE_MODE%"=="auto" set "PDF_PIPELINE_MODE=%ROUTE_HINT_PDF_MODE%"
+if /I not "%PDF_PIPELINE_MODE%"=="auto" if /I not "%PDF_PIPELINE_MODE%"=="gpu" if /I not "%PDF_PIPELINE_MODE%"=="cpu" if /I not "%PDF_PIPELINE_MODE%"=="visual" (
+  echo.
+  call echo [WARN] 无效的 PDF 模式 "%PDF_PIPELINE_MODE%"，已回退为 auto。
+  set "PDF_PIPELINE_MODE=auto"
+)
+
+if /I "%PDF_PIPELINE_MODE%"=="visual" if "%SKIP_DOCX%"=="1" (
+  echo.
+  call echo [WARN] PDF mode visual 需要同时提供 DOCX 与 PDF；当前为 PDF-only，已回退为 auto。
+  set "PDF_PIPELINE_MODE=auto"
+)
+
+if /I "%PDF_PIPELINE_MODE%"=="visual" if not defined PDF (
+  echo.
+  call echo [WARN] PDF mode visual 需要 PDF 输入；当前未提供 PDF，已回退为 auto。
+  set "PDF_PIPELINE_MODE=auto"
+)
+
+if "%SKIP_DOCX_PENDING_HINT%"=="1" (
+  if /I "%PDF_PIPELINE_MODE%"=="cpu" (
+    call echo [ROUTE] 已保留 DOCX，因为最终 PDF 模式为 cpu，需要正文 KB 参与 merge。
+  ) else (
+    if /I "%PDF_PIPELINE_MODE%"=="visual" (
+      call echo [ROUTE] 已保留 DOCX，因为最终 PDF 模式为 visual，需要 DOCX 正文作为基底。
+    ) else (
+      set "SKIP_DOCX=1"
+      set "DOCX_SEMANTIC_CORRECTION=0"
+      call echo [ROUTE] 根据质量评估跳过 DOCX Step 1，切换为 PDF-native 主路径。
+    )
+  )
+  set "SKIP_DOCX_PENDING_HINT=0"
+)
+
+set "RUN_MODE=DOCX+PDF"
+if not defined PDF set "RUN_MODE=DOCX-only"
+if "%SKIP_DOCX%"=="1" set "RUN_MODE=PDF-only"
+
+call :RESOLVE_MANIFEST_PATH
+if errorlevel 1 (
+  set "RC=2"
+  set "FAILED_STEP=resolve-manifest"
+  goto END
+)
+
+goto AFTER_MANIFEST
+
+:AFTER_MANIFEST
+
+call :PREPARE_DOC_ARTIFACTS
+if errorlevel 1 (
+  set "RC=2"
+  set "FAILED_STEP=prepare-artifacts"
+  goto END
+)
+
+call echo ============================================
+call echo 知识库全流程
+call echo ============================================
+call echo fileId     : %FILE_ID%
+call echo docx       : %DOCX%
+call echo pdf        : %PDF%
+call echo cropArgs   : %CROP_EXTRA%
+call echo pdfNativeArgs: %PDF_NATIVE_EXTRA%
+call echo pdfMode    : %PDF_PIPELINE_MODE%
+call echo route      : %DOCX_ROUTE%
+call echo docxQuality: %DOCX_QUALITY%
+call echo pdfText    : %PDF_TEXT_PROFILE%
+call echo docxPreClean: %DOCX_SEMANTIC_CORRECTION%
+call echo manifest   : %MANIFEST%
+call echo page-match : %PAGE_MATCH%
+call echo scopeUnit  : %SCOPE_UNIT%
+call echo cleanup    : %CLEANUP%
+call echo step1Script: %BUILD_KB_SCRIPT%
+if defined ROUTE_REASON call echo routeReason: %ROUTE_REASON%
+if defined TESSERACT_CMD call echo tesseract  : %TESSERACT_CMD%
+
+call :LOG [DBG] FILE_ID=%FILE_ID% DOCX=%DOCX% PDF=%PDF% SKIP_DOCX=%SKIP_DOCX% CROP_EXTRA=%CROP_EXTRA% PDF_NATIVE_EXTRA=%PDF_NATIVE_EXTRA% MANIFEST=%MANIFEST% PAGE_MATCH=%PAGE_MATCH% DOC_DIR=%DOC_DIR% SHOTS_DIR=%SHOTS_DIR%
+
+pushd "%REPO_ROOT%" >nul 2>&1
+if errorlevel 1 (
+  echo.
+  echo [ERROR] Failed to enter repo root: "%REPO_ROOT%"
+  set "RC=3"
+  set "FAILED_STEP=pushd"
+  goto END
+)
+
+if "%SKIP_DOCX%"=="1" (
+  set "FLOW_DOCX=SKIPPED"
+  echo.
+  echo [SKIP] 未提供有效 DOCX，已跳过 Step 1（DOCX to knowledge_base）。
+) else (
+  set "FLOW_DOCX=RUNNING"
+  set "STEP1_OUT=%DOC_DIR%\knowledge_base.json"
+  set "STEP1_DOCX_EXTRA=--out ""%DOC_DIR%\knowledge_base.json"" --original-screenshots-root ""%ASSETS_KB_ROOT%"" --export-table-images --source ""assets/kb/%FILE_ID%"""
+  REM Prefer PDF screenshots for DOCX+PDF runs; avoid low-quality DOCX table_pos exports by default.
+  if defined PDF set "STEP1_DOCX_EXTRA=--out ""%DOC_DIR%\knowledge_base.json"" --original-screenshots-root ""%ASSETS_KB_ROOT%"" --skip-table-image-export --write-original-screenshots-manifest --source ""assets/kb/%FILE_ID%"""
+  if /I "%FORCE_DOCX_TABLE_POS%"=="1" if defined PDF set "STEP1_DOCX_EXTRA=--out ""%DOC_DIR%\knowledge_base.json"" --original-screenshots-root ""%ASSETS_KB_ROOT%"" --export-table-images --source ""assets/kb/%FILE_ID%"""
+  if "%DOCX_SEMANTIC_CORRECTION%"=="1" set "STEP1_DOCX_EXTRA=!STEP1_DOCX_EXTRA! --docx-semantic-correction --docx-semantic-correction-max-candidates %DOCX_SEMANTIC_MAX_CANDIDATES% --docx-semantic-correction-audit ""%DOC_DIR%\docx_semantic_corrections.csv"""
+  echo.
+  echo [1/4] DOCX 生成 knowledge_base.json
+  call :LOG [DBG] Running build_kb_from_docx: PYEXE=!PYEXE! BUILD_KB_SCRIPT=!BUILD_KB_SCRIPT! DOCX=!DOCX! FILE_ID=!FILE_ID! EXTRA=!STEP1_DOCX_EXTRA!
+  "!PYEXE!" "!BUILD_KB_SCRIPT!" --docx "!DOCX!" --file-id "!FILE_ID!" !STEP1_DOCX_EXTRA! >> "%RUN_LOG%" 2>&1
+  if errorlevel 1 (
+    echo.
+    echo [ERROR] Step 1 failed: !BUILD_KB_SCRIPT!
+    set "FLOW_DOCX=FAILED"
+    set "RC=1"
+    set "FAILED_STEP=1"
+    goto END
+  )
+  set "FLOW_DOCX=SUCCESS"
+  echo [OK] Step 1 completed.
+)
+
+REM If PDF was not provided, we can finish after Step 1.
+if not defined PDF (
+  set "FLOW_PDF=SKIPPED"
+  echo.
+  echo [SKIP] 未提供 PDF，已跳过 Step 2~4。
+  goto POST_PROCESS
+)
+
+set "FLOW_PDF=RUNNING"
+
+REM Auto-skip PDF pipeline when DOCX has no tables/images.
+call :LOG [DBG] Running detect_kb_visual_assets: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\validation\detect_kb_visual_assets.py FILE_ID=%FILE_ID% ASSETS_KB_ROOT=%ASSETS_KB_ROOT%
+"%PYEXE%" "%SCRIPT_DIR%..\validation\detect_kb_visual_assets.py" --file-id "%FILE_ID%" --assets-root "%ASSETS_KB_ROOT%" >> "%RUN_LOG%" 2>&1
+if errorlevel 2 (
+  echo.
+  echo [WARN] 无法判断是否包含表格/图片，将继续执行 PDF 相关流程。
+) else (
+  if errorlevel 1 (
+    REM Has visuals -> continue.
+  ) else (
+    echo.
+    echo [SKIP] DOCX has no tables or images.
+    REM If DOCX is skipped but PDF is provided, force PDF-native path.
+    if "%SKIP_DOCX%"=="1" if defined PDF (
+      echo [INFO] DOCX skipped and PDF detected. Switching to PDF-native flow...
+      goto PROCESS_PDF_NATIVE
+    )
+    echo [INFO] DOCX+PDF mode still enabled. Continuing with Steps 2-4 to extract PDF visuals.
+  )
+)
+
+echo.
+if /I "%PDF_PIPELINE_MODE%"=="cpu" (
+  echo [INFO] PDF pipeline mode=cpu. Forcing legacy Step2/3 path.
+  goto PROCESS_PDF_LEGACY_MERGE
+)
+if /I "%PDF_PIPELINE_MODE%"=="visual" (
+  echo [INFO] PDF pipeline mode=visual. Using DOCX text + PDF visual-only extraction path.
+  goto PROCESS_PDF_LEGACY_MERGE
+)
+if /I "%PDF_PIPELINE_MODE%"=="gpu" (
+  echo [INFO] PDF pipeline mode=gpu. Forcing PDF-native path.
+  if "%SKIP_DOCX%"=="1" (
+    goto PROCESS_PDF_NATIVE
+  ) else (
+    goto PROCESS_PDF_NATIVE_FOR_MERGE
+  )
+)
+
+REM Detect native PDF flow: if input is a PDF, allow PDF-native pipeline to run instead
+for %%F in ("%PDF%") do set "PDF_EXT=%%~xF"
+if /I "%PDF_EXT%"==".pdf" (
+  if "%SKIP_DOCX%"=="1" (
+    echo [INFO] PDF-only mode detected. Starting PDF-native pipeline...
+    goto PROCESS_PDF_NATIVE
+  ) else (
+    echo [INFO] DOCX+PDF mode detected. Switching to PDF-native visual extraction + merge pipeline.
+    goto PROCESS_PDF_NATIVE_FOR_MERGE
+  )
+)
+
+:PROCESS_PDF_LEGACY_MERGE
+echo [2/4] PDF 导出分页图片
+call :LOG [DBG] Running export_pdf_pages_to_original_screenshots: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\imaging\export_pdf_pages_to_original_screenshots.py PDF=%PDF% FILE_ID=%FILE_ID% OUT_ROOT=%ASSETS_KB_ROOT%
+"%PYEXE%" "%SCRIPT_DIR%..\imaging\export_pdf_pages_to_original_screenshots.py" --pdf "%PDF%" --file-id "%FILE_ID%" --out-root "%ASSETS_KB_ROOT%" >> "%RUN_LOG%" 2>&1
+if errorlevel 1 (
+  echo.
+  echo [ERROR] Step 2 failed: export_pdf_pages_to_original_screenshots.py
+  set "FLOW_PDF=FAILED"
+  set "RC=1"
+  set "FAILED_STEP=2"
+  goto END
+)
+echo [OK] Step 2 completed.
+
+echo.
+echo [3/4] 裁剪表格与图例并生成 manifest
+call :LOG [DBG] Running crop_pdf_tables_and_legends: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\imaging\crop_pdf_tables_and_legends.py FILE_ID=%FILE_ID% ROOT=%ASSETS_KB_ROOT% CROP_EXTRA=%CROP_EXTRA%
+"%PYEXE%" "%SCRIPT_DIR%..\imaging\crop_pdf_tables_and_legends.py" --file-id "%FILE_ID%" --root "%ASSETS_KB_ROOT%" %CROP_EXTRA% >> "%RUN_LOG%" 2>&1
+if errorlevel 1 (
+  echo.
+  echo [ERROR] Step 3 failed: crop_pdf_tables_and_legends.py
+  echo If you see OpenCV/Numpy missing, run: pip install opencv-python numpy
+  set "FLOW_PDF=FAILED"
+  set "RC=1"
+  set "FAILED_STEP=3"
+  goto END
+)
+
+echo [OK] Step 3 completed.
+echo [INFO] Step 3 完成，进入 Step 4 合并。
+goto SKIP_TO_MERGE
+
+:PROCESS_PDF_NATIVE_FOR_MERGE
+set "FLOW_PDF=RUNNING"
+set "PDF_NATIVE_TMP_KB=%DOC_DIR%\knowledge_base.pdf_native.merge.tmp.json"
+
+call :SELECT_PDF_NATIVE_PY
+if errorlevel 1 (
+  set "PDF_NATIVE_PYEXE=%PYEXE%"
+  call echo [WARN] DOCX+PDF 未找到包含 PaddleOCR 的解释器，将先尝试当前解释器: %PDF_NATIVE_PYEXE%
+) else (
+  call echo [INFO] DOCX+PDF 已选择支持 PaddleOCR 的解释器: %PDF_NATIVE_PYEXE%
+)
+
+if /I "%PDF_PIPELINE_MODE%"=="gpu" (
+  call :CHECK_PADDLE_GPU_READY "%PDF_NATIVE_PYEXE%"
+  if errorlevel 1 (
+    echo.
+    echo [ERROR] GPU mode forced but selected interpreter cannot run Paddle on gpu:0
+    echo        interpreter: %PDF_NATIVE_PYEXE%
+    set "FLOW_PDF=FAILED"
+    set "RC=1"
+    set "FAILED_STEP=gpu-runtime-check"
+    goto END
+  )
+)
+
+echo.
+echo [2/4] PDF-native 提取截图（用于合并）
+call :LOG [DBG] Running pdf_to_base64_kb(for-merge): PYEXE=%PDF_NATIVE_PYEXE% SCRIPT=%SCRIPT_DIR%..\tools\pdf_to_base64_kb.py PDF=%PDF% OUT=%PDF_NATIVE_TMP_KB% FILE_ID=%FILE_ID% ASSETS_ROOT=%ASSETS_KB_ROOT% PDF_NATIVE_EXTRA=%PDF_NATIVE_EXTRA% CROP_EXTRA=%CROP_EXTRA% TARGET=1363148
+if exist "%PDF_PROGRESS_RUNNER%" (
+  "!PYEXE!" "!PDF_PROGRESS_RUNNER!" --python-exe "!PDF_NATIVE_PYEXE!" --script "!SCRIPT_DIR!..\tools\pdf_to_base64_kb.py" --pdf "!PDF!" --out "!PDF_NATIVE_TMP_KB!" --file-id "!FILE_ID!" --assets-root "!ASSETS_KB_ROOT!" --log "%RUN_LOG%" --target-bytes 1363148 !PDF_NATIVE_EXTRA! !CROP_EXTRA!
+) else (
+  "!PDF_NATIVE_PYEXE!" "!SCRIPT_DIR!..\tools\pdf_to_base64_kb.py" --pdf "!PDF!" --out "!PDF_NATIVE_TMP_KB!" --file-id "!FILE_ID!" --assets-root "!ASSETS_KB_ROOT!" !PDF_NATIVE_EXTRA! !CROP_EXTRA! --target-bytes 1363148 >> "%RUN_LOG%" 2>&1
+)
+if errorlevel 1 (
+  echo.
+  if /I "%PDF_PIPELINE_MODE%"=="gpu" (
+    echo [ERROR] PDF-native 提取失败（GPU 模式强制，不回退 CPU）。error=%ERRORLEVEL%
+    set "FLOW_PDF=FAILED"
+    set "RC=1"
+    set "FAILED_STEP=pdf-native-for-merge"
+    goto END
+  ) else (
+    echo [WARN] PDF-native 提取失败，回退到 legacy Step 2/3。error=%ERRORLEVEL%
+    goto PROCESS_PDF_LEGACY_MERGE
+  )
+)
+echo [OK] Step 2 completed.
+
+echo.
+echo [3/4] 生成 merge 所需 manifest（兼容旧合并逻辑）
+call :LOG [DBG] Running pdf_native_kb_to_manifest: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\tools\pdf_native_kb_to_manifest.py KB=%PDF_NATIVE_TMP_KB% FILE_ID=%FILE_ID% ASSETS_ROOT=%ASSETS_KB_ROOT% OUT=%MANIFEST%
+"%PYEXE%" "%SCRIPT_DIR%..\tools\pdf_native_kb_to_manifest.py" --kb "%PDF_NATIVE_TMP_KB%" --file-id "%FILE_ID%" --assets-root "%ASSETS_KB_ROOT%" --out "%MANIFEST%" >> "%RUN_LOG%" 2>&1
+if errorlevel 1 (
+  echo.
+  if /I "%PDF_PIPELINE_MODE%"=="gpu" (
+    echo [ERROR] PDF-native manifest 转换失败（GPU 模式强制，不回退 CPU）。error=%ERRORLEVEL%
+    set "FLOW_PDF=FAILED"
+    set "RC=1"
+    set "FAILED_STEP=pdf-native-manifest"
+    goto END
+  ) else (
+    echo [WARN] PDF-native manifest 转换失败，回退到 legacy Step 2/3。error=%ERRORLEVEL%
+    goto PROCESS_PDF_LEGACY_MERGE
+  )
+)
+
+echo [OK] Step 3 completed.
+echo [INFO] 已使用 PDF-native 生成截图与 manifest，继续 Step 4 合并。
+goto SKIP_TO_MERGE
+
+:: Handler for PDF-native path: call pdf_to_base64_kb.py and then jump to merge
+:PROCESS_PDF_NATIVE
+rem Ensure shots dir exists
+if not exist "%SHOTS_DIR%" mkdir "%SHOTS_DIR%" >nul 2>&1
+
+set "KB_FILE=%DOC_DIR%\knowledge_base.json"
+set "FLOW_PDF=RUNNING"
+
+call :SELECT_PDF_NATIVE_PY
+if errorlevel 1 (
+  set "PDF_NATIVE_PYEXE=%PYEXE%"
+  call echo [WARN] 未找到包含 PaddleOCR 的解释器，PDF-native 将退化为 CV fallback。当前解释器: %PDF_NATIVE_PYEXE%
+) else (
+  call echo [INFO] PDF-native 已选择支持 PaddleOCR 的解释器: %PDF_NATIVE_PYEXE%
+)
+
+if /I "%PDF_PIPELINE_MODE%"=="gpu" (
+  call :CHECK_PADDLE_GPU_READY "%PDF_NATIVE_PYEXE%"
+  if errorlevel 1 (
+    echo.
+    echo [ERROR] GPU mode forced but selected interpreter cannot run Paddle on gpu:0
+    echo        interpreter: %PDF_NATIVE_PYEXE%
+    set "FLOW_PDF=FAILED"
+    set "RC=1"
+    set "FAILED_STEP=gpu-runtime-check"
+    goto END
+  )
+)
+
+echo.
+echo [PDF-NATIVE] 调用 pdf_to_base64_kb.py 以原生方式构建知识库和截图
+call :LOG [DBG] Running pdf_to_base64_kb: PYEXE=%PDF_NATIVE_PYEXE% SCRIPT=%SCRIPT_DIR%..\tools\pdf_to_base64_kb.py PDF=%PDF% OUT=%KB_FILE% FILE_ID=%FILE_ID% ASSETS_ROOT=%ASSETS_KB_ROOT% PDF_NATIVE_EXTRA=%PDF_NATIVE_EXTRA% CROP_EXTRA=%CROP_EXTRA% TARGET=1363148
+if exist "%PDF_PROGRESS_RUNNER%" (
+  "!PYEXE!" "!PDF_PROGRESS_RUNNER!" --python-exe "!PDF_NATIVE_PYEXE!" --script "!SCRIPT_DIR!..\tools\pdf_to_base64_kb.py" --pdf "!PDF!" --out "!KB_FILE!" --file-id "!FILE_ID!" --assets-root "!ASSETS_KB_ROOT!" --log "%RUN_LOG%" --target-bytes 1363148 !PDF_NATIVE_EXTRA! !CROP_EXTRA!
+) else (
+  "!PDF_NATIVE_PYEXE!" "!SCRIPT_DIR!..\tools\pdf_to_base64_kb.py" --pdf "!PDF!" --out "!KB_FILE!" --file-id "!FILE_ID!" --assets-root "!ASSETS_KB_ROOT!" !PDF_NATIVE_EXTRA! !CROP_EXTRA! --target-bytes 1363148 >> "%RUN_LOG%" 2>&1
+)
+if errorlevel 1 (
+  echo.
+  echo [ERROR] PDF 原生提取失败，请检查 PyMuPDF/环境。 error=%ERRORLEVEL%
+  set "FLOW_PDF=FAILED"
+  set "RC=1"
+  set "FAILED_STEP=pdf-native"
+  goto END
+) else (
+  set "FLOW_PDF=SUCCESS"
+  echo [SUCCESS] PDF-Native 知识库构建完成: %KB_FILE%
+)
+
+  REM PDF-Native 成功：跳过 manifest 合并，继续执行统一后处理清洗链路
+  echo [INFO] PDF-native completed. Skipping manifest merge and continuing to post-processing.
+  goto POST_PROCESS
+
+:: Continue to merge step (normal DOCX/PDF flow)
+:SKIP_TO_MERGE
+echo.
+echo [4/4] 合并 manifest 到 knowledge_base.json
+
+REM 如果跳过了 DOCX 步骤但 knowledge_base.json 缺失，生成一个基本的空 KB 以便 merge 脚本可以运行
+if "%SKIP_DOCX%"=="1" (
+  if not exist "%DOC_DIR%\knowledge_base.json" (
+    echo [INFO] DOCX 跳过且未找到 knowledge_base.json，正在创建最小占位文件: %DOC_DIR%\knowledge_base.json
+    if not exist "%DOC_DIR%" mkdir "%DOC_DIR%" >nul 2>&1
+    echo {^"fileMetadata^": {^"entriesCount^": 0, ^"imagesCount^": 0^}, ^"entries^": []^} > "%DOC_DIR%\knowledge_base.json"
+  )
+)
+if "%DEBUG_MERGE%"=="1" (
+  if defined SCOPE_UNIT (
+    call :LOG [DBG] Running merge_manifest_to_kb debug: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%merge_manifest_to_kb.py FILE_ID=%FILE_ID% ASSETS=%ASSETS_KB_ROOT% MANIFEST=%MANIFEST% PAGE_MATCH=%PAGE_MATCH% SCOPE=%SCOPE_UNIT%
+    "%PYEXE%" "%SCRIPT_DIR%merge_manifest_to_kb.py" --file-id "%FILE_ID%" --assets-root "%ASSETS_KB_ROOT%" --manifest "%MANIFEST%" --page-match "%PAGE_MATCH%" --scope-unit-name "%SCOPE_UNIT%" --debug-merge >> "%RUN_LOG%" 2>&1
+  ) else (
+    call :LOG [DBG] Running merge_manifest_to_kb debug: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%merge_manifest_to_kb.py FILE_ID=%FILE_ID% ASSETS=%ASSETS_KB_ROOT% MANIFEST=%MANIFEST% PAGE_MATCH=%PAGE_MATCH%
+    "%PYEXE%" "%SCRIPT_DIR%merge_manifest_to_kb.py" --file-id "%FILE_ID%" --assets-root "%ASSETS_KB_ROOT%" --manifest "%MANIFEST%" --page-match "%PAGE_MATCH%" --debug-merge >> "%RUN_LOG%" 2>&1
+  )
+) else (
+  if defined SCOPE_UNIT (
+    call :LOG [DBG] Running merge_manifest_to_kb: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%merge_manifest_to_kb.py FILE_ID=%FILE_ID% ASSETS=%ASSETS_KB_ROOT% MANIFEST=%MANIFEST% PAGE_MATCH=%PAGE_MATCH% SCOPE=%SCOPE_UNIT%
+    "%PYEXE%" "%SCRIPT_DIR%merge_manifest_to_kb.py" --file-id "%FILE_ID%" --assets-root "%ASSETS_KB_ROOT%" --manifest "%MANIFEST%" --page-match "%PAGE_MATCH%" --scope-unit-name "%SCOPE_UNIT%" >> "%RUN_LOG%" 2>&1
+  ) else (
+    call :LOG [DBG] Running merge_manifest_to_kb: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%merge_manifest_to_kb.py FILE_ID=%FILE_ID% ASSETS=%ASSETS_KB_ROOT% MANIFEST=%MANIFEST% PAGE_MATCH=%PAGE_MATCH%
+    "%PYEXE%" "%SCRIPT_DIR%merge_manifest_to_kb.py" --file-id "%FILE_ID%" --assets-root "%ASSETS_KB_ROOT%" --manifest "%MANIFEST%" --page-match "%PAGE_MATCH%" >> "%RUN_LOG%" 2>&1
+  )
+)
+if errorlevel 1 (
+  echo.
+  echo [ERROR] Step 4 failed: merge_manifest_to_kb.py
+  set "FLOW_PDF=FAILED"
+  set "RC=1"
+  set "FAILED_STEP=4"
+  goto END
+)
+set "FLOW_PDF=SUCCESS"
+echo [OK] Step 4 completed.
+
+:POST_PROCESS
+
+REM Ensure PaddleOCR model path is set for GPU runtime (can be overridden externally)
+if not defined PADDLE_OCR_INFERENCE_PATH (
+  set "PADDLE_OCR_INFERENCE_PATH=%SCRIPT_DIR%..\PaddleOCR-release-2.6\inference"
+)
+
+REM Prepare pipeline output dir for intermediate artifacts
+set "PIPE_OUT=%~dp0..\outputs"
+for %%I in ("%PIPE_OUT%") do set "PIPE_OUT=%%~fI"
+if not exist "%PIPE_OUT%" mkdir "%PIPE_OUT%"
+set "PENDING_CSV=%PIPE_OUT%\change_log.csv"
+set "ALIGN_CSV=%PIPE_OUT%\alignment_debug.csv"
+if exist "%PENDING_CSV%" del /q "%PENDING_CSV%" >nul 2>&1
+if exist "%ALIGN_CSV%" del /q "%ALIGN_CSV%" >nul 2>&1
+if not defined KB_ENABLE_CROPPED_SHOT_OCR set "KB_ENABLE_CROPPED_SHOT_OCR=0"
+
+REM [5/6] 运行 GPU OCR + RAG 修复（production_refactor）
+echo.
+echo [5/6] Cropped-shot OCR writeback gate
+set "KB_FILE=%DOC_DIR%\knowledge_base.json"
+if not exist "%KB_FILE%" (
+  echo [WARN] 未找到知识库文件，跳过 Step 5~6: %KB_FILE%
+  set "FLOW_POST=SKIPPED_NO_KB"
+  set "FLOW_ALIGN=SKIPPED_NO_KB"
+  goto POST_PROCESS_END
+)
+
+if /I not "%KB_ENABLE_CROPPED_SHOT_OCR%"=="1" (
+  set "FLOW_POST=SKIPPED_DISABLED"
+  set "FLOW_ALIGN=SKIPPED_DISABLED"
+  echo [SKIP] Cropped-shot OCR writeback disabled by default; screenshots stay visual-only.
+  echo [INFO] Set KB_ENABLE_CROPPED_SHOT_OCR=1 to re-enable legacy Step 5/6.
+  goto POST_PROCESS_END
+)
+
+set "HAS_SHOT_IMAGES=0"
+for %%F in ("%SHOTS_DIR%\*.png" "%SHOTS_DIR%\*.jpg" "%SHOTS_DIR%\*.jpeg" "%SHOTS_DIR%\*.webp") do (
+  if exist %%~fF set "HAS_SHOT_IMAGES=1"
+)
+
+if "%HAS_SHOT_IMAGES%"=="1" (
+  set "FLOW_POST=RUNNING"
+  echo [INFO] KB_ENABLE_CROPPED_SHOT_OCR=1，执行旧版截图 OCR+RAG 回写流程。
+  call :LOG [DBG] Running production_refactor: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\scripts\utils\production_refactor.py IMAGES=%SHOTS_DIR% KB=%KB_FILE% OUT=%PIPE_OUT% WORKERS=4
+  "%PYEXE%" "%SCRIPT_DIR%..\scripts\utils\production_refactor.py" --images-dir "%SHOTS_DIR%" --kb "%KB_FILE%" --out-dir "%PIPE_OUT%" --workers 4 >> "%RUN_LOG%" 2>&1
+  if errorlevel 1 (
+    echo.
+    echo [ERROR] production_refactor failed
+    set "FLOW_POST=FAILED"
+    set "RC=1"
+    set "FAILED_STEP=production_refactor"
+    goto END
+  )
+  set "FLOW_POST=SUCCESS"
+  echo [OK] Step 5 completed.
+) else (
+  set "FLOW_POST=SKIPPED_NO_SHOTS"
+  echo [WARN] 截图目录为空或不存在，跳过 production_refactor: %SHOTS_DIR%
+)
+
+REM [6/6] 运行对齐并执行强制洗白（alignment_debug -> final_purify）
+echo.
+echo [6/6] Generating alignment_debug.csv and applying final purify
+set "FINAL_PURIFY_SCRIPT=%SCRIPT_DIR%..\scripts\utils\final_purify.py"
+if exist "%PENDING_CSV%" (
+  set "FLOW_ALIGN=RUNNING"
+  rem Run approve_fix to produce knowledge_base.fixed.json (non-destructive)
+  echo [5.5] Applying approve_fix to generate knowledge_base.fixed.json if applicable
+  call :LOG [DBG] Running approve_fix: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\validation\approve_fix.py KB=%KB_FILE% PENDING=%PENDING_CSV%
+  "%PYEXE%" "%SCRIPT_DIR%..\validation\approve_fix.py" --kb "%KB_FILE%" --pending "%PENDING_CSV%" >> "%RUN_LOG%" 2>&1
+  if errorlevel 1 (
+    echo [WARN] approve_fix failed or returned error; continuing to alignment step
+  )
+
+  call :LOG [DBG] Running alignment_debug: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\validation\alignment_debug.py KB=%KB_FILE% OUT=%PIPE_OUT% PENDING=%PENDING_CSV%
+  "%PYEXE%" "%SCRIPT_DIR%..\validation\alignment_debug.py" --kb "%KB_FILE%" --out-dir "%PIPE_OUT%" --pending "%PENDING_CSV%" >> "%RUN_LOG%" 2>&1
+  if errorlevel 1 (
+    set "FLOW_ALIGN=FAILED"
+    echo [WARN] alignment_debug failed; skipping final_purify
+  ) else (
+    if exist "!ALIGN_CSV!" (
+      if exist "!FINAL_PURIFY_SCRIPT!" (
+        call :LOG [DBG] Running final_purify: PYEXE=%PYEXE% SCRIPT=!FINAL_PURIFY_SCRIPT! ALIGN=!ALIGN_CSV! KB=%KB_FILE% THRESH=0.3
+        "%PYEXE%" "!FINAL_PURIFY_SCRIPT!" --alignment "!ALIGN_CSV!" --kb "%KB_FILE%" --threshold 0.3 >> "%RUN_LOG%" 2>&1
+        if errorlevel 1 (
+          set "FLOW_ALIGN=PARTIAL"
+          echo [WARN] final_purify failed
+        ) else (
+          set "FLOW_ALIGN=SUCCESS"
+          echo [OK] Step 6 completed.
+        )
+      ) else (
+        set "FLOW_ALIGN=SUCCESS_NO_PURIFY"
+        call :LOG [WARN] final_purify script missing; skipping optional purge step: !FINAL_PURIFY_SCRIPT!
+        echo [WARN] final_purify script missing; skipped optional purge step.
+        echo [OK] Step 6 completed.
+      )
+    ) else (
+      set "FLOW_ALIGN=FAILED_NO_ALIGNMENT"
+      echo [WARN] alignment_debug did not produce alignment_debug.csv
+    )
+  )
+) else (
+  set "FLOW_ALIGN=SKIPPED_NO_PENDING"
+  echo [WARN] change_log.csv not found in %PIPE_OUT%; skipping alignment and purify
+)
+
+:POST_PROCESS_END
+
+REM Generic KB schema/quality post-fix (safe, reusable for all fileIds)
+call :RUN_STEP7_REPAIR_AND_AUDIT
+
+if /I "!STEP7_STATUS!"=="DONE" (
+  echo [OK] Step 7 completed.
+) else (
+  echo [SKIP] Step 7 skipped ^(knowledge_base.json not found^).
+)
+
+set "RC=0"
+goto END
+
+:END
+REM Best-effort popd if we had pushd'd.
+popd >nul 2>&1
+
+REM Persist ASCII exit code for external callers/CI (avoid UTF-16 from PowerShell redirection)
+echo %RC% > "%~dp0run_full_kb_pipeline.exit" 2>nul || (
+  rem fallback: try writing with redirected cmd echo
+  > "%~dp0run_full_kb_pipeline.exit" echo %RC%
+)
+
+call :COLLECT_RUN_STATS
+call :PRINT_RUN_SUMMARY
+
+REM Optional cleanup after successful run.
+if "%RC%"=="0" if "%CLEANUP%"=="1" call :CLEANUP_ARTIFACTS
+
+echo.
+if "%RC%"=="0" (
+  echo [OK] Full pipeline finished.
+) else (
+  echo [ERROR] Full pipeline failed. step=%FAILED_STEP% exitCode=%RC%
+)
+
+if /I "%RUN_FULL_KB_NO_PAUSE%"=="1" goto SKIP_FINAL_PAUSE
+
+if "%INTERACTIVE%"=="1" pause
+
+rem When run non-interactively (e.g., by double-click), always pause so output doesn't disappear.
+if not "%INTERACTIVE%"=="1" pause
+
+:SKIP_FINAL_PAUSE
+exit /b %RC%
+
+:CLEANUP_ARTIFACTS
+set "KB_DIR=%ASSETS_KB_ROOT%"
+set "FILE_ID_WIN=%FILE_ID:/=\%"
+set "DOC_DIR=%KB_DIR%\%FILE_ID_WIN%"
+set "SHOTS_DIR=%DOC_DIR%\截图"
+
+if exist "%DOC_DIR%\pages" (
+  rmdir /s /q "%DOC_DIR%\pages" >nul 2>&1
+)
+if exist "%DOC_DIR%\debug" (
+  rmdir /s /q "%DOC_DIR%\debug" >nul 2>&1
+)
+if defined MANIFEST (
+  if exist "%MANIFEST%" del /q "%MANIFEST%" >nul 2>&1
+)
+if exist "%SHOTS_DIR%\manifest.json" del /q "%SHOTS_DIR%\manifest.json" >nul 2>&1
+if exist "%DOC_DIR%\manifest.json" del /q "%DOC_DIR%\manifest.json" >nul 2>&1
+if exist "%DOC_DIR%\page_*.png" del /q "%DOC_DIR%\page_*.png" >nul 2>&1
+if exist "%DOC_DIR%\legend_*.png" del /q "%DOC_DIR%\legend_*.png" >nul 2>&1
+if exist "%DOC_DIR%\table_*.png" del /q "%DOC_DIR%\table_*.png" >nul 2>&1
+if defined PDF_NATIVE_TMP_KB if exist "%PDF_NATIVE_TMP_KB%" del /q "%PDF_NATIVE_TMP_KB%" >nul 2>&1
+
+echo.
+echo [CLEAN] 已清理 pages/、debug/、临时 manifest 与根目录散落截图（如存在）。
+exit /b 0
+
+:COLLECT_RUN_STATS
+set "SHOT_COUNT=0"
+set "DEEPSEEK_ROWS=0"
+set "CHANGED_ROWS=0"
+set "DEEPSEEK_EFFECTIVE_ROWS=0"
+set "CHANGED_EFFECTIVE_ROWS=0"
+set "DEEPSEEK_CONFIGURED=NO"
+set "DOCX_CORRECTION_ROWS=0"
+set "KB_EXISTS=NO"
+set "KB_ULTRA_EXISTS=NO"
+set "ALIGN_EXISTS=NO"
+
+if not defined KB_FILE if defined DOC_DIR set "KB_FILE=%DOC_DIR%\knowledge_base.json"
+if not defined KB_ULTRA_FILE if defined DOC_DIR set "KB_ULTRA_FILE=%DOC_DIR%\knowledge_base.ultra_clean.json"
+if not defined PENDING_CSV if defined PIPE_OUT set "PENDING_CSV=%PIPE_OUT%\change_log.csv"
+if not defined ALIGN_CSV if defined PIPE_OUT set "ALIGN_CSV=%PIPE_OUT%\alignment_debug.csv"
+
+if defined KB_FILE if exist "%KB_FILE%" set "KB_EXISTS=YES"
+if defined KB_ULTRA_FILE if exist "%KB_ULTRA_FILE%" set "KB_ULTRA_EXISTS=YES"
+if defined ALIGN_CSV if exist "%ALIGN_CSV%" set "ALIGN_EXISTS=YES"
+
+if defined DOC_DIR if exist "%DOC_DIR%\docx_semantic_corrections.csv" (
+  set "DOCX_CORRECTION_LINES=0"
+  for /f %%N in ('find /v /c "" ^< "%DOC_DIR%\docx_semantic_corrections.csv"') do set "DOCX_CORRECTION_LINES=%%N"
+  call :ENSURE_NONNEG_INT DOCX_CORRECTION_LINES
+  if defined DOCX_CORRECTION_LINES if !DOCX_CORRECTION_LINES! GTR 1 set /a DOCX_CORRECTION_ROWS=!DOCX_CORRECTION_LINES!-1
+)
+
+if defined SHOTS_DIR if exist "%SHOTS_DIR%\" (
+  for %%F in ("%SHOTS_DIR%\*.png" "%SHOTS_DIR%\*.jpg" "%SHOTS_DIR%\*.jpeg" "%SHOTS_DIR%\*.webp") do (
+    if exist "%%~fF" set /a SHOT_COUNT+=1
+  )
+)
+
+if defined PENDING_CSV if exist "%PENDING_CSV%" (
+  set "PENDING_LINES=0"
+  for /f %%N in ('find /v /c "" ^< "%PENDING_CSV%"') do set "PENDING_LINES=%%N"
+  if defined PENDING_LINES if !PENDING_LINES! GTR 1 set /a DEEPSEEK_ROWS=!PENDING_LINES!-1
+
+  set "TMP_CHANGED=%TEMP%\powerai_changed_rows_%RANDOM%_%RANDOM%.txt"
+  if defined PYEXE if exist "%SCRIPT_DIR%..\scripts\utils\count_changed_rows.py" (
+    "%PYEXE%" "%SCRIPT_DIR%..\scripts\utils\count_changed_rows.py" --csv "%PENDING_CSV%" > "!TMP_CHANGED!" 2>nul
+    if exist "!TMP_CHANGED!" (
+      set /p CHANGED_ROWS=<"!TMP_CHANGED!"
+      del /q "!TMP_CHANGED!" >nul 2>&1
+    )
+  )
+
+  if not defined CHANGED_ROWS set "CHANGED_ROWS=0"
+
+  set "TMP_SUMMARY=%TEMP%\powerai_changelog_summary_%RANDOM%_%RANDOM%.txt"
+  if defined PYEXE if exist "%SCRIPT_DIR%..\scripts\utils\summarize_change_log.py" (
+    "%PYEXE%" "%SCRIPT_DIR%..\scripts\utils\summarize_change_log.py" --csv "%PENDING_CSV%" > "!TMP_SUMMARY!" 2>nul
+    if exist "!TMP_SUMMARY!" (
+      for /f "usebackq tokens=1,2 delims==" %%A in ("!TMP_SUMMARY!") do (
+        if /I "%%A"=="EFFECTIVE" set "DEEPSEEK_EFFECTIVE_ROWS=%%B"
+        if /I "%%A"=="CHANGED_EFFECTIVE" set "CHANGED_EFFECTIVE_ROWS=%%B"
+        if /I "%%A"=="CLIENT_NOT_CONFIGURED" set "DEEPSEEK_CLIENT_NOT_CONFIGURED_ROWS=%%B"
+        if /I "%%A"=="UNCHANGED_STATUS" set "DEEPSEEK_UNCHANGED_STATUS_ROWS=%%B"
+      )
+      del /q "!TMP_SUMMARY!" >nul 2>&1
+    )
+  )
+
+  if not defined DEEPSEEK_EFFECTIVE_ROWS set "DEEPSEEK_EFFECTIVE_ROWS=0"
+  if not defined CHANGED_EFFECTIVE_ROWS set "CHANGED_EFFECTIVE_ROWS=0"
+  if not defined DEEPSEEK_CLIENT_NOT_CONFIGURED_ROWS set "DEEPSEEK_CLIENT_NOT_CONFIGURED_ROWS=0"
+  if not defined DEEPSEEK_UNCHANGED_STATUS_ROWS set "DEEPSEEK_UNCHANGED_STATUS_ROWS=0"
+
+  call :ENSURE_NONNEG_INT DEEPSEEK_ROWS
+  call :ENSURE_NONNEG_INT CHANGED_ROWS
+  call :ENSURE_NONNEG_INT DEEPSEEK_EFFECTIVE_ROWS
+  call :ENSURE_NONNEG_INT CHANGED_EFFECTIVE_ROWS
+  call :ENSURE_NONNEG_INT DEEPSEEK_CLIENT_NOT_CONFIGURED_ROWS
+  call :ENSURE_NONNEG_INT DEEPSEEK_UNCHANGED_STATUS_ROWS
+)
+
+set "TMP_DEEPSEEK=%TEMP%\powerai_deepseek_cfg_%RANDOM%_%RANDOM%.txt"
+if defined PYEXE if exist "%SCRIPT_DIR%..\scripts\utils\check_deepseek_config.py" (
+  "%PYEXE%" "%SCRIPT_DIR%..\scripts\utils\check_deepseek_config.py" > "%TMP_DEEPSEEK%" 2>nul
+  if exist "%TMP_DEEPSEEK%" (
+    set /p DEEPSEEK_CONFIGURED=<"%TMP_DEEPSEEK%"
+    del /q "%TMP_DEEPSEEK%" >nul 2>&1
+  )
+)
+
+if /I not "%DEEPSEEK_CONFIGURED%"=="YES" set "DEEPSEEK_CONFIGURED=NO"
+
+if /I "%DEEPSEEK_CONFIGURED%"=="YES" (
+  set "DEEPSEEK_STATUS=RUN_NO_CHANGES"
+  if !DEEPSEEK_ROWS! LEQ 0 set "DEEPSEEK_STATUS=NOT_RUN"
+  if !DEEPSEEK_ROWS! GTR 0 set "DEEPSEEK_STATUS=RUN_NO_CHANGES"
+  if !CHANGED_ROWS! GTR 0 set "DEEPSEEK_STATUS=RUN_WITH_NON_EFFECTIVE_CHANGES"
+  if !DEEPSEEK_EFFECTIVE_ROWS! GTR 0 set "DEEPSEEK_STATUS=RUN_NO_EFFECTIVE_CHANGE"
+  if !DEEPSEEK_CLIENT_NOT_CONFIGURED_ROWS! GTR 0 set "DEEPSEEK_STATUS=RUN_CLIENT_NOT_CONFIGURED"
+  if !CHANGED_EFFECTIVE_ROWS! GTR 0 set "DEEPSEEK_STATUS=RUN_WITH_EFFECTIVE_CHANGES"
+) else (
+  if !DEEPSEEK_ROWS! GTR 0 (
+    set "DEEPSEEK_STATUS=NOT_CONFIGURED_BUT_ROWS_PRESENT"
+  ) else (
+    set "DEEPSEEK_STATUS=NOT_CONFIGURED"
+  )
+)
+
+if /I not "%FLOW_PDF%"=="SKIPPED" (
+  set "TMP_OCR_RUNTIME=%TEMP%\powerai_ocr_runtime_%RANDOM%_%RANDOM%.txt"
+  if defined PYEXE if exist "%SCRIPT_DIR%..\scripts\utils\check_ocr_runtime.py" (
+    "%PYEXE%" "%SCRIPT_DIR%..\scripts\utils\check_ocr_runtime.py" > "!TMP_OCR_RUNTIME!" 2>nul
+    if exist "!TMP_OCR_RUNTIME!" (
+      for /f "usebackq tokens=1,* delims==" %%A in ("!TMP_OCR_RUNTIME!") do (
+        if /I "%%A"=="backend" set "OCR_BACKEND=%%B"
+        if /I "%%A"=="gpuRequested" set "OCR_GPU_REQUESTED=%%B"
+        if /I "%%A"=="gpuAvailable" set "OCR_GPU_AVAILABLE=%%B"
+        if /I "%%A"=="fallbackOccurred" set "OCR_FALLBACK_OCCURRED=%%B"
+      )
+      del /q "!TMP_OCR_RUNTIME!" >nul 2>&1
+    )
+  )
+)
+
+if not defined OCR_BACKEND set "OCR_BACKEND=UNKNOWN"
+if /I not "%OCR_GPU_REQUESTED%"=="YES" set "OCR_GPU_REQUESTED=NO"
+if /I not "%OCR_GPU_AVAILABLE%"=="YES" set "OCR_GPU_AVAILABLE=NO"
+if /I not "%OCR_FALLBACK_OCCURRED%"=="YES" set "OCR_FALLBACK_OCCURRED=NO"
+exit /b 0
+
+:RUN_STEP7_REPAIR_AND_AUDIT
+set "STEP7_STATUS=SKIPPED_NO_KB"
+if not defined KB_FILE exit /b 0
+if not exist "%KB_FILE%" exit /b 0
+
+set "STEP7_STATUS=DONE"
+
+if exist "%SCRIPT_DIR%..\scripts\repair_kb.py" (
+  echo.
+  echo [7/7] Running generic KB repair ^(source / IMAGE_REF / imagesCount^)
+  call :LOG [DBG] Running repair_kb: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\scripts\repair_kb.py KB=%KB_FILE%
+  "%PYEXE%" "%SCRIPT_DIR%..\scripts\repair_kb.py" "%KB_FILE%" >> "%RUN_LOG%" 2>&1
+  if errorlevel 1 (
+    echo [WARN] repair_kb.py failed; keep existing KB and continue.
+  )
+)
+
+if exist "%SCRIPT_DIR%..\scripts\audit_kb_quality.py" (
+  set "KB_AUDIT_LOG=%PIPE_OUT%\kb_quality_audit.txt"
+  echo.
+  echo [7/7] Running KB quality audit ^(report only^)
+  call :LOG [DBG] Running audit_kb_quality: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\scripts\audit_kb_quality.py KB=%KB_FILE% LOG=!KB_AUDIT_LOG!
+  "%PYEXE%" "%SCRIPT_DIR%..\scripts\audit_kb_quality.py" "%KB_FILE%" > "!KB_AUDIT_LOG!" 2>&1
+  if errorlevel 1 (
+    echo [WARN] KB quality audit found issues. See: !KB_AUDIT_LOG!
+  ) else (
+    echo [INFO] KB quality audit passed. See: !KB_AUDIT_LOG!
+  )
+)
+exit /b 0
+
+:ENSURE_NONNEG_INT
+set "INT_VALUE=!%~1!"
+if not defined INT_VALUE (
+  set "%~1=0"
+  exit /b 0
+)
+echo(!INT_VALUE!| findstr /r "^[0-9][0-9]*$" >nul || set "%~1=0"
+exit /b 0
+
+:PRINT_RUN_SUMMARY
+echo.
+echo ============================================
+echo RUN SUMMARY
+echo ============================================
+echo mode          : %RUN_MODE%
+echo pdfMode       : %PDF_PIPELINE_MODE%
+echo docxFlow      : %FLOW_DOCX%
+echo pdfFlow       : %FLOW_PDF%
+echo postFlow      : %FLOW_POST%
+echo alignFlow     : %FLOW_ALIGN%
+echo fileId        : %FILE_ID%
+echo kbPath        : %KB_FILE%
+echo kbExists      : %KB_EXISTS%
+echo ultraKbPath   : %KB_ULTRA_FILE%
+echo ultraKbExists : %KB_ULTRA_EXISTS%
+echo shotsDir      : %SHOTS_DIR%
+echo shotCount     : %SHOT_COUNT%
+echo pendingCsv    : %PENDING_CSV%
+echo ocrBackend    : %OCR_BACKEND%
+echo ocrGpuRequested: %OCR_GPU_REQUESTED%
+echo ocrGpuAvailable: %OCR_GPU_AVAILABLE%
+echo ocrFallback   : %OCR_FALLBACK_OCCURRED%
+echo deepseekConfigured: %DEEPSEEK_CONFIGURED%
+echo deepseekStatus: %DEEPSEEK_STATUS%
+echo docxRoute     : %DOCX_ROUTE%
+echo docxQuality   : %DOCX_QUALITY%
+echo pdfTextProfile: %PDF_TEXT_PROFILE%
+echo docxPreClean  : %DOCX_SEMANTIC_CORRECTION%
+echo docxCorrectionRows: %DOCX_CORRECTION_ROWS%
+echo deepseekRows  : %DEEPSEEK_ROWS%
+echo deepseekEffectiveRows: %DEEPSEEK_EFFECTIVE_ROWS%
+echo deepseekClientNotConfiguredRows: %DEEPSEEK_CLIENT_NOT_CONFIGURED_ROWS%
+echo deepseekUnchangedStatusRows: %DEEPSEEK_UNCHANGED_STATUS_ROWS%
+echo changedRows   : %CHANGED_ROWS%
+echo changedEffectiveRows: %CHANGED_EFFECTIVE_ROWS%
+echo alignCsv      : %ALIGN_CSV%
+echo alignExists   : %ALIGN_EXISTS%
+echo failedStep    : %FAILED_STEP%
+echo exitCode      : %RC%
+exit /b 0
+
+:AUTO_ROUTE_DOCX_PDF
+set "DOCX_ROUTE=unknown"
+set "ROUTE_HINT_PDF_MODE="
+set "SKIP_DOCX_HINT=0"
+set "SKIP_DOCX_PENDING_HINT=0"
+if not defined DOCX if not defined PDF exit /b 0
+if not defined PYEXE exit /b 0
+if not exist "%SCRIPT_DIR%..\scripts\utils\assess_docx_pdf_route.py" exit /b 0
+
+set "TMP_ROUTE=%TEMP%\powerai_route_%RANDOM%_%RANDOM%.txt"
+"%PYEXE%" "%SCRIPT_DIR%..\scripts\utils\assess_docx_pdf_route.py" --docx "%DOCX%" --pdf "%PDF%" > "%TMP_ROUTE%" 2>nul
+if errorlevel 1 (
+  if exist "%TMP_ROUTE%" del /q "%TMP_ROUTE%" >nul 2>&1
+  exit /b 0
+)
+
+if exist "%TMP_ROUTE%" (
+  for /f "usebackq tokens=1,* delims==" %%A in ("%TMP_ROUTE%") do (
+    if /I "%%A"=="ROUTE" set "DOCX_ROUTE=%%B"
+    if /I "%%A"=="DOCX_QUALITY" set "DOCX_QUALITY=%%B"
+    if /I "%%A"=="PDF_TEXT_PROFILE" set "PDF_TEXT_PROFILE=%%B"
+    if /I "%%A"=="PDF_MODE_HINT" set "ROUTE_HINT_PDF_MODE=%%B"
+    if /I "%%A"=="SKIP_DOCX_HINT" set "SKIP_DOCX_HINT=%%B"
+    if /I "%%A"=="ENABLE_DOCX_SEMANTIC_CORRECTION" set "DOCX_SEMANTIC_CORRECTION=%%B"
+    if /I "%%A"=="ROUTE_REASON" set "ROUTE_REASON=%%B"
+    if /I "%%A"=="DOCX_SUSPICIOUS_RATIO" set "DOCX_SUSPICIOUS_RATIO=%%B"
+    if /I "%%A"=="PDF_NATIVE_RATIO" set "PDF_NATIVE_RATIO=%%B"
+  )
+  del /q "%TMP_ROUTE%" >nul 2>&1
+)
+
+if "%DOCX_SEMANTIC_CORRECTION%"=="1" (
+  if exist "%SCRIPT_DIR%build_kb_from_docx.py" if /I not "%BUILD_KB_SCRIPT%"=="%SCRIPT_DIR%build_kb_from_docx.py" (
+    set "BUILD_KB_SCRIPT=%SCRIPT_DIR%build_kb_from_docx.py"
+    call echo [ROUTE] 已启用 DOCX 定向纠错，Step 1 切换为本仓库 build_kb_from_docx.py。
+  )
+)
+
+set "AUTO_ROUTE_SAFE_TO_SKIP=1"
+if "%INTERACTIVE%"=="1" if /I "%FILE_ID%"=="auto" if "%PDF_MODE_USER_SET%"=="0" set "AUTO_ROUTE_SAFE_TO_SKIP=0"
+
+if "%SKIP_DOCX_HINT%"=="1" (
+  if "%AUTO_ROUTE_SAFE_TO_SKIP%"=="1" (
+    if /I not "%PDF_PIPELINE_MODE%"=="cpu" if /I not "%PDF_PIPELINE_MODE%"=="visual" (
+      set "SKIP_DOCX=1"
+      set "DOCX_SEMANTIC_CORRECTION=0"
+    ) else (
+      set "SKIP_DOCX_PENDING_HINT=1"
+    )
+  ) else (
+    set "SKIP_DOCX_PENDING_HINT=1"
+  )
+)
+
+call echo [ROUTE] route=%DOCX_ROUTE% docxQuality=%DOCX_QUALITY% pdfText=%PDF_TEXT_PROFILE% reason=%ROUTE_REASON%
+exit /b 0
+
+:PREPARE_DOC_ARTIFACTS
+set "KB_DIR=%ASSETS_KB_ROOT%"
+set "FILE_ID_WIN=%FILE_ID:/=\%"
+set "DOC_DIR=%KB_DIR%\%FILE_ID_WIN%"
+set "SHOTS_DIR=%DOC_DIR%\截图"
+
+if not exist "%DOC_DIR%" mkdir "%DOC_DIR%" >nul 2>&1
+if not exist "%DOC_DIR%\" exit /b 2
+if not exist "%SHOTS_DIR%" mkdir "%SHOTS_DIR%" >nul 2>&1
+if not exist "%SHOTS_DIR%\" exit /b 2
+
+if exist "%DOC_DIR%\pages" rmdir /s /q "%DOC_DIR%\pages" >nul 2>&1
+if exist "%DOC_DIR%\debug" rmdir /s /q "%DOC_DIR%\debug" >nul 2>&1
+if exist "%SHOTS_DIR%\manifest.json" del /q "%SHOTS_DIR%\manifest.json" >nul 2>&1
+if exist "%MANIFEST%" del /q "%MANIFEST%" >nul 2>&1
+for %%F in ("%SHOTS_DIR%\*.png" "%SHOTS_DIR%\*.jpg" "%SHOTS_DIR%\*.jpeg" "%SHOTS_DIR%\*.webp") do (
+  if exist %%~fF del /q %%~fF >nul 2>&1
+)
+
+echo.
+echo [PREP] 已清理旧的 截图/、pages/、debug/ 产物。
+exit /b 0
+
+:DERIVE_FILE_ID
+set "TMP_DIR=%REPO_ROOT%\build\tmp"
+if not exist "%TMP_DIR%" mkdir "%TMP_DIR%" >nul 2>&1
+if not exist "%TMP_DIR%\" (
+  echo.
+  echo [ERROR] 创建临时目录失败，无法生成 fileId。
+  echo repoRoot: %REPO_ROOT%
+  echo tmpDir  : %TMP_DIR%
+  exit /b 2
+)
+
+set "TMP_FILEID=%TMP_DIR%\powerai_fileid_%RANDOM%_%RANDOM%.txt"
+  if defined KB_PREFIX (
+    if defined DOC_FOR_DERIVE (
+      call :LOG [DBG] Running derive_file_id with prefix: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\utils\derive_file_id.py DOC=!DOC_FOR_DERIVE! PREFIX=!KB_PREFIX! TMP=!TMP_FILEID!
+      "%PYEXE%" "%SCRIPT_DIR%..\utils\derive_file_id.py" --doc "!DOC_FOR_DERIVE!" --prefix "!KB_PREFIX!" 1>"!TMP_FILEID!" 2>nul
+    ) else (
+      call :LOG [DBG] Running derive_file_id with prefix: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\utils\derive_file_id.py DOC=!DOCX! PREFIX=!KB_PREFIX! TMP=!TMP_FILEID!
+      "%PYEXE%" "%SCRIPT_DIR%..\utils\derive_file_id.py" --doc "!DOCX!" --prefix "!KB_PREFIX!" 1>"!TMP_FILEID!" 2>nul
+    )
+) else (
+    if defined DOC_FOR_DERIVE (
+      call :LOG [DBG] Running derive_file_id: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\utils\derive_file_id.py DOC=!DOC_FOR_DERIVE! TMP=!TMP_FILEID!
+      "%PYEXE%" "%SCRIPT_DIR%..\utils\derive_file_id.py" --doc "!DOC_FOR_DERIVE!" 1>"!TMP_FILEID!" 2>nul
+    ) else (
+      call :LOG [DBG] Running derive_file_id: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\utils\derive_file_id.py DOC=!DOCX! TMP=!TMP_FILEID!
+      "%PYEXE%" "%SCRIPT_DIR%..\utils\derive_file_id.py" --doc "!DOCX!" 1>"!TMP_FILEID!" 2>nul
+    )
+)
+if errorlevel 1 (
+  echo.
+  echo [ERROR] 调用 derive_file_id.py 生成 fileId 失败。
+  echo tmpFile : %TMP_FILEID%
+  exit /b 2
+)
+if not exist "%TMP_FILEID%" (
+  echo.
+  echo [ERROR] 写入生成的 fileId 到临时文件失败。
+  echo tmpFile : %TMP_FILEID%
+  exit /b 2
+)
+
+set "FILE_ID="
+set /p FILE_ID=<"%TMP_FILEID%"
+del /q "%TMP_FILEID%" >nul 2>&1
+
+if not defined FILE_ID (
+  echo.
+  echo [ERROR] 生成的 fileId 为空。
+  exit /b 2
+)
+
+echo 已生成 fileId: %FILE_ID%
+exit /b 0
+
+:PICK_PREFIX
+set "TMP_DIR=%REPO_ROOT%\build\tmp"
+if not exist "%TMP_DIR%" mkdir "%TMP_DIR%" >nul 2>&1
+if not exist "%TMP_DIR%\" (
+  echo.
+  echo [ERROR] 创建临时目录失败，无法运行分类向导。
+  exit /b 2
+)
+
+set "TMP_PREFIX=%TMP_DIR%\powerai_prefix_%RANDOM%_%RANDOM%.txt"
+call :LOG [DBG] Running pick_kb_prefix: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\classification\pick_kb_prefix.py TMP=%TMP_PREFIX%
+"%PYEXE%" "%SCRIPT_DIR%..\classification\pick_kb_prefix.py" 1>"%TMP_PREFIX%"
+if errorlevel 1 (
+  echo.
+  echo [ERROR] 分类向导执行失败。
+  exit /b 2
+)
+if not exist "%TMP_PREFIX%" (
+  echo.
+  echo [ERROR] 写入分类前缀到临时文件失败。
+  exit /b 2
+)
+
+set "KB_PREFIX="
+set /p KB_PREFIX=<"%TMP_PREFIX%"
+del /q "%TMP_PREFIX%" >nul 2>&1
+
+if not defined KB_PREFIX (
+  echo.
+  echo [ERROR] 分类前缀为空。
+  exit /b 2
+)
+
+echo 已选择分类前缀: %KB_PREFIX%
+exit /b 0
+
+:RESOLVE_MANIFEST_PATH
+if not defined PDF (
+  set "MANIFEST="
+  exit /b 0
+)
+set "TMP_DIR=%REPO_ROOT%\build\tmp"
+if not exist "%TMP_DIR%" mkdir "%TMP_DIR%" >nul 2>&1
+if not exist "%TMP_DIR%\" (
+  echo.
+  echo [ERROR] 创建临时目录失败，无法解析 manifest 路径。
+  echo repoRoot: %REPO_ROOT%
+  echo tmpDir  : %TMP_DIR%
+  exit /b 2
+)
+
+set "TMP_MANIFEST=%TMP_DIR%\powerai_manifest_%RANDOM%_%RANDOM%.txt"
+call :LOG [DBG] Running resolve_kb_manifest_path: PYEXE=%PYEXE% SCRIPT=%SCRIPT_DIR%..\utils\resolve_kb_manifest_path.py FILE_ID=%FILE_ID% ASSETS=%ASSETS_KB_ROOT% TMP=%TMP_MANIFEST%
+"%PYEXE%" "%SCRIPT_DIR%..\utils\resolve_kb_manifest_path.py" --file-id "%FILE_ID%" --assets-root "%ASSETS_KB_ROOT%" 1>"%TMP_MANIFEST%" 2>nul
+if errorlevel 1 (
+  echo.
+  echo [ERROR] 调用 resolve_kb_manifest_path.py 解析 manifest 路径失败。
+  exit /b 2
+)
+if not exist "%TMP_MANIFEST%" (
+  echo.
+  echo [ERROR] 写入 manifest 路径到临时文件失败。
+  exit /b 2
+)
+
+set "MANIFEST="
+set /p MANIFEST=<"%TMP_MANIFEST%"
+del /q "%TMP_MANIFEST%" >nul 2>&1
+
+if not defined MANIFEST (
+  echo.
+  echo [ERROR] 解析得到的 manifest 路径为空。
+  exit /b 2
+)
+
+exit /b 0
+
+:SET_PYEXE_IF_EXISTS
+set "CANDIDATE_PY=%~1"
+if not defined CANDIDATE_PY exit /b 0
+if /I not "%PYEXE%"=="python" exit /b 0
+if exist "%CANDIDATE_PY%" set "PYEXE=%CANDIDATE_PY%"
+exit /b 0
+
+:TRY_ACTIVATE_VENV
+if "%VENV_ACTIVATED%"=="1" exit /b 0
+set "ACTIVATE_CANDIDATE=%~1"
+if not defined ACTIVATE_CANDIDATE exit /b 1
+if not exist "%ACTIVATE_CANDIDATE%" exit /b 1
+
+call "%ACTIVATE_CANDIDATE%"
+if errorlevel 1 exit /b 1
+
+set "VENV_ACTIVATED=1"
+set "VENV_ACTIVATED_PATH=%ACTIVATE_CANDIDATE%"
+exit /b 0
+
+:SELECT_PDF_NATIVE_PY
+set "PDF_NATIVE_PYEXE=%PYEXE%"
+
+call :TRY_PDF_NATIVE_PY "%POWERAI_PYEXE%"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%SCRIPT_DIR%..\.venv\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%SCRIPT_DIR%..\.venv3.11\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%SCRIPT_DIR%..\.venv_ocr\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%SCRIPT_DIR%..\venv\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%REPO_ROOT%\.venv\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%REPO_ROOT%\.venv3.11\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%REPO_ROOT%\.venv_ocr\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%REPO_ROOT%\venv\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%PYEXE%"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%LATEST_REPO%\.venv\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%LATEST_REPO%\.venv3.11\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+call :TRY_PDF_NATIVE_PY "%LATEST_REPO%\.venv_ocr\Scripts\python.exe"
+if not errorlevel 1 exit /b 0
+
+exit /b 1
+
+:TRY_PDF_NATIVE_PY
+set "TRY_PY=%~1"
+if not defined TRY_PY exit /b 1
+if not exist "%TRY_PY%" exit /b 1
+
+call :CHECK_PADDLE_READY "%TRY_PY%"
+if errorlevel 1 exit /b 1
+
+set "PDF_NATIVE_PYEXE=%TRY_PY%"
+exit /b 0
+
+:CHECK_PADDLE_READY
+if "%~1"=="" exit /b 1
+"%~1" -c "import importlib.util as u, sys; sys.exit(0 if u.find_spec('paddleocr') and u.find_spec('paddle') else 1)" >nul 2>&1
+exit /b %ERRORLEVEL%
+
+:CHECK_PADDLE_GPU_READY
+if "%~1"=="" exit /b 1
+"%~1" -c "import sys,paddle; ok=paddle.is_compiled_with_cuda(); paddle.set_device('gpu:0'); paddle.to_tensor([1.0]); sys.exit(0 if ok else 1)" >nul 2>&1
+exit /b %ERRORLEVEL%
+
+goto :eof
+
+:LOG
+if "%~1"=="" exit /b 0
+>> "%RUN_LOG%" echo [%DATE% %TIME%] %*
+exit /b 0
+
+:GET_BASENAME
+REM usage: call :GET_BASENAME "C:\path\to\file.pdf"
+setlocal EnableDelayedExpansion
+set "ARG=%~1"
+set "BASENAME="
+call :LOG [DBG] GET_BASENAME source=!ARG!
+
+REM quick check for problematic shell metacharacters
+echo(!ARG!| findstr /R "[&|<>]" >nul 2>&1
+if not errorlevel 1 call :LOG [WARN] GET_BASENAME detected special character in path: !ARG!
+
+for %%F in ("!ARG!") do set "BASENAME=%%~nF"
+if not defined BASENAME (
+  call :LOG [ERROR] GET_BASENAME failed to extract basename from !ARG!
+  endlocal
+  exit /b 1
+)
+
+REM sanitize basename: replace spaces with underscores and strip some special chars
+set "SAN_BASENAME=!BASENAME: =_!"
+set "SAN_BASENAME=!SAN_BASENAME:&=!"
+set "SAN_BASENAME=!SAN_BASENAME:|=!"
+set "SAN_BASENAME=!SAN_BASENAME:<=!"
+set "SAN_BASENAME=!SAN_BASENAME:>=!"
+set "SAN_BASENAME=!SAN_BASENAME:"=!"
+
+endlocal & set "FILE_ID=%SAN_BASENAME%"
+call :LOG [DBG] GET_BASENAME result=%FILE_ID%
+exit /b 0
+
+:TO_ABS_PATH
+REM usage: call :TO_ABS_PATH "relative-or-absolute-path" VAR_NAME
+setlocal
+set "IN_PATH=%~1"
+if not defined IN_PATH (
+  endlocal
+  exit /b 0
+)
+for %%F in ("%IN_PATH%") do set "ABS_PATH=%%~fF"
+endlocal & set "%~2=%ABS_PATH%"
+exit /b 0

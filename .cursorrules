@@ -1,0 +1,16 @@
+# Agent Executive Ironclads (Agent 执行铁律)
+
+## 1. CRITICAL: FILE DELETION & MODIFICATION BOUNDARIES
+- **NEVER** delete, move, or rename any files or directories unless explicitly and recovery-safely commanded by the user in the current turn.
+- **NEVER** trust patterns like "无用", "temp", "test", "debug", "old", or "backup" as safe-to-delete. Treat ALL existing files as production-critical assets.
+- Do NOT touch or attempt to clean up any `.dll`, `.bat`, `.ps1`, `.txt` credentials, or alternative virtual environments (e.g., `.venv_*`) without double confirmation.
+- If you think a file is redundant, you must ASK the user first: "May I archive [file_path]?" Never automate the destructive action.
+
+## 2. TERMINAL COMMAND RESTRICTIONS
+- Avoid using dangerous destructive commands like `rm -rf`, `Remove-Item -Recurse -Force`, or global moving operations.
+- Before executing any command that modifies the file tree structure, print the exact command and explicitly state what files will be affected in the chat.
+
+## 3. ERROR LOGGING & LESSON LEARNING
+- This project maintains an error and misoperation ledger at `docs/ERROR_LEDGER.md`.
+- Before you write any code or execute any tool, you MUST read `docs/ERROR_LEDGER.md` to avoid repeating past critical mistakes.
+- If any automated tool failure, file loss, or logic hallucination occurs, you must immediately document it in `docs/ERROR_LEDGER.md` following the official template.
