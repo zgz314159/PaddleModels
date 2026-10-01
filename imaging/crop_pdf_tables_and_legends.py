@@ -1405,6 +1405,12 @@ def main() -> int:
         default=4,
         help="If OCR text length is below this, try extra probes (default: 4)",
     )
+    ap.add_argument(
+        "--structure",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable PP-Structure table recognition for table crops.",
+    )
 
     args = ap.parse_args()
 
@@ -1454,6 +1460,14 @@ def main() -> int:
     }
 
     page_heading_hints = _load_kb_heading_hints(root, safe_file_id)
+
+    table_recognizer = None
+    if args.structure:
+        try:
+            from pdf_table_structure import TableStructureRecognizer
+            table_recognizer = TableStructureRecognizer()
+        except Exception as e:
+            print(f"[WARN] Failed to initialize TableStructureRecognizer: {e}")
 
     all_items: List[Dict[str, object]] = []
     total_written = 0
@@ -1742,6 +1756,30 @@ def main() -> int:
                 item["anchorBox"] = anchor_box
             if anchor_boxes:
                 item["anchorBoxes"] = anchor_boxes
+
+            if c.kind == "table" and table_recognizer:
+                try:
+                    # Run PP-Structure on the cropped table image
+                    structure_results = table_recognizer.process_image(crop)
+                    if structure_results:
+                        # Usually one crop contains one primary table
+                        main_table = structure_results[0]
+                        item["tableStructure"] = main_table.get("logic_structure", [])
+                        item["tableHtml"] = main_table.get("html", "")
+
+                        # Save structure sidecar files
+                        struct_json_name = out_name.replace(".png", ".structure.json")
+                        struct_html_name = out_name.replace(".png", ".structure.html")
+
+                        with open(out_dir / struct_json_name, "w", encoding="utf-8") as f:
+                            json.dump(main_table, f, ensure_ascii=False, indent=2)
+                        with open(out_dir / struct_html_name, "w", encoding="utf-8") as f:
+                            f.write(main_table.get("html", ""))
+
+                        item["structureFile"] = struct_json_name
+                except Exception as ex:
+                    print(f"[WARN] Table structure recognition failed for {out_name}: {ex}")
+
             all_items.append(item)
 
             # Update collision boundary for the next block on this page.

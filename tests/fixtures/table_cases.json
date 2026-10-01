@@ -1,0 +1,40 @@
+{
+  "pdf": "samples/103号(2).pdf",
+  "cases": [
+    {
+      "page": 28,
+      "expected_min_tables": 0,
+      "require_structured": false,
+      "role": "negative",
+      "notes": "adjacent page before first known table; native find_tables empty"
+    },
+    {
+      "page": 29,
+      "expected_min_tables": 1,
+      "require_structured": true,
+      "role": "positive",
+      "notes": "load table 6x4; Phase 2A primary fixture"
+    },
+    {
+      "page": 30,
+      "expected_min_tables": 0,
+      "require_structured": false,
+      "role": "negative",
+      "notes": "adjacent page after table page"
+    },
+    {
+      "page": 32,
+      "expected_min_tables": 1,
+      "require_structured": true,
+      "role": "positive",
+      "notes": "two native tables (7x6 and 2x6); no threshold tuning this phase"
+    },
+    {
+      "page": 36,
+      "expected_min_tables": 1,
+      "require_structured": true,
+      "role": "positive",
+      "notes": "three native tables; regression only"
+    }
+  ]
+}
