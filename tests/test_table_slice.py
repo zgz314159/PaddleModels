@@ -122,7 +122,8 @@ class TestCellsAndMarkdown(unittest.TestCase):
         self.assertEqual(tb["type"], "table")
         self.assertTrue(tb["searchable"])
         self.assertEqual(tb["structureStatus"], "structured")
-        self.assertEqual(len(tb["table_rows"]), 3)
+        self.assertEqual(len(tb["rows"]), 3)
+        self.assertNotIn("table_rows", tb)
 
     def test_image_only_not_in_content(self):
         ir = CanonicalIR(document_id="d", sha256="0" * 64)
@@ -162,7 +163,8 @@ class TestCellsAndMarkdown(unittest.TestCase):
         self.assertNotIn("| --- |", e["contentMarkdown"])
         tb = next(b for b in e["blocks"] if b["type"] == "table")
         self.assertFalse(tb["searchable"])
-        self.assertEqual(tb["table_rows"], [])
+        self.assertEqual(tb["rows"], [])
+        self.assertNotIn("table_rows", tb)
         self.assertEqual(tb["structureStatus"], "image_only")
         self.assertEqual(tb["imageUri"], "shots/t1.png")
 
@@ -524,10 +526,12 @@ class TestPage29Acceptance(unittest.TestCase):
         ir.pages.append(page)
         kb = SemanticProjector("d", strategy="heading").project(ir)
         tb = kb["entries"][0]["blocks"][0]
-        self.assertEqual(tb["rows"], 6)
-        self.assertEqual(tb["cols"], 4)
+        self.assertEqual(len(tb["rows"]), 6)
+        self.assertEqual(len(tb["rows"][0]), 4)
+        self.assertNotIn("table_rows", tb)
+        self.assertNotIn("cols", tb)
         self.assertEqual(len(tb["cells"]), 20)
-        for row in tb["table_rows"]:
+        for row in tb["rows"]:
             self.assertEqual(len(row), 4)
         content = kb["entries"][0]["contentMarkdown"]
         self.assertEqual(content.count("油门全开"), 1)
@@ -564,8 +568,7 @@ class TestCellsSchemaPhase2C(unittest.TestCase):
                 "blocks": [{
                     "id": "b",
                     "type": "table",
-                    "rows": 6,
-                    "cols": 4,
+                    "rows": [["", "", "", "x"], ["", "", "", ""], ["", "", "", ""], ["", "", "", ""], ["", "", "", ""]],
                     "cells": [{
                         "row": 1,
                         "col": 3,
@@ -664,6 +667,97 @@ class TestTableDiffGeometryStats(unittest.TestCase):
         self.assertEqual(cd["v2_geometry"]["physical_cells"], 20)  # 24-4 spanned slots as anchors only
         self.assertTrue(report["cell_count_notes"])
         self.assertIn("text-split", report["cell_count_notes"][0] + report["note"] if "note" in report else report["cell_count_notes"][0] + cd.get("counting_note", ""))
+
+
+class TestTableRowsContractFix(unittest.TestCase):
+    """v2 table contract: 2D `rows`, no `table_rows`/integer counts in new output."""
+
+    _SPANNED_TABLE = [
+        {"row": 0, "col": 0, "text": "h1"},
+        {"row": 0, "col": 1, "text": "h2"},
+        {"row": 1, "col": 0, "text": "merged", "rowSpan": 2, "colSpan": 1},
+        {"row": 1, "col": 1, "text": "b"},
+        {"row": 2, "col": 1, "text": "c"},
+    ]
+
+    def _ir(self, cells, status="structured", image="shots/t.png"):
+        ir = CanonicalIR(document_id="d", sha256="0" * 64)
+        page = DocPage(page_number=1, width=200, height=300, method="native")
+        page.blocks.append(
+            DocBlock(
+                id="t1",
+                type="table",
+                text="",
+                bbox=BBox(1, 2, 3, 4),
+                page_number=1,
+                reading_order=1,
+                metadata={"cells": cells, "structureStatus": status, "imageUri": image},
+            )
+        )
+        ir.pages.append(page)
+        return ir
+
+    def _project_block(self, cells, status="structured", image="shots/t.png"):
+        kb = SemanticProjector("d", strategy="heading").project(self._ir(cells, status, image))
+        return kb["entries"][0]["blocks"][0]
+
+    def test_structured_rows_is_2d_strings(self):
+        tb = self._project_block(self._SPANNED_TABLE)
+        self.assertNotIn("table_rows", tb)
+        self.assertIsInstance(tb["rows"], list)
+        self.assertTrue(all(isinstance(r, list) for r in tb["rows"]))
+        self.assertTrue(all(isinstance(c, str) for r in tb["rows"] for c in r))
+
+    def test_merged_anchor_only_and_spans_preserved(self):
+        tb = self._project_block(self._SPANNED_TABLE)
+        self.assertEqual(len(tb["rows"]), 3)
+        self.assertEqual(len(tb["rows"][0]), 2)
+        self.assertEqual(tb["rows"][1][0], "merged")
+        self.assertEqual(tb["rows"][2][0], "")  # spanned slot stays empty (anchor-only)
+        anchor = [c for c in tb["cells"] if c["text"] == "merged"][0]
+        self.assertEqual((anchor["rowSpan"], anchor["colSpan"]), (2, 1))
+
+    def test_image_only_rows_empty_and_no_int(self):
+        tb = self._project_block([], status="image_only")
+        self.assertEqual(tb["rows"], [])
+        self.assertNotIn("table_rows", tb)
+        self.assertNotIn("cols", tb)
+        self.assertEqual(tb["structureStatus"], "image_only")
+        self.assertEqual(tb["imageUri"], "shots/t.png")
+
+    def test_serialized_json_types(self):
+        tb = self._project_block(self._SPANNED_TABLE)
+        loaded = json.loads(json.dumps(tb))["rows"]
+        self.assertIsInstance(loaded, list)
+        self.assertTrue(all(isinstance(r, list) for r in loaded))
+        self.assertTrue(all(isinstance(c, str) for r in loaded for c in r))
+
+    def test_projected_kb_validates_against_schema(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        kb = SemanticProjector("d", strategy="heading").project(self._ir(self._SPANNED_TABLE))
+        schema = json.loads(KB_SCHEMA.read_text(encoding="utf-8"))
+        jsonschema.validate(instance=kb, schema=schema)
+
+    def test_legacy_compat_read_still_accepts_table_rows(self):
+        legacy_block = {"type": "table", "table_rows": [["a", "b"], ["c", ""]], "pageNumber": 1}
+        m = kb_metrics_from_obj(
+            {
+                "fileMetadata": {"schemaVersion": "2.0", "fileId": "d", "docSha256": "0" * 64},
+                "entries": [{"entryId": "e", "blocks": [legacy_block]}],
+            },
+            include_figure_association=False,
+        )
+        self.assertEqual(m["table_cells"], 3)
+        self.assertNotIn("table_rows", self._project_block(self._SPANNED_TABLE))
+
+    def test_content_markdown_equivalent(self):
+        tb = self._project_block(self._SPANNED_TABLE)
+        expected = table_rows_to_markdown(tb["rows"])
+        kb = SemanticProjector("d", strategy="heading").project(self._ir(self._SPANNED_TABLE))
+        self.assertIn(expected, kb["entries"][0]["contentMarkdown"])
 
 
 if __name__ == "__main__":

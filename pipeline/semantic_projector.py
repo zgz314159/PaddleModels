@@ -270,7 +270,7 @@ class SemanticProjector:
                     block_out: Dict[str, Any] = {
                         "id": b_id,
                         "type": "table",
-                        "table_rows": table_rows if is_structured else [],
+                        "rows": table_rows if is_structured else [],
                         "pageNumber": p_num,
                         "semanticRole": "table",
                         "structureStatus": structure_status if structure_status in (
@@ -289,8 +289,6 @@ class SemanticProjector:
                         "src": (b_meta.get("imageUri", "") if isinstance(b_meta, dict) else "")
                     }
                     if is_structured:
-                        block_out["rows"] = int(meta_rows)
-                        block_out["cols"] = int(meta_cols)
                         block_out["cells"] = cells_out
                     current_entry["blocks"].append(block_out)
                     continue
