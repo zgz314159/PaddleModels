@@ -9,6 +9,30 @@ def _norm_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
 
 
+def _canonical_rows_grid(container: Dict[str, Any]) -> List[Any]:
+    """Canonical 2D grid. Prefer a list-valued `rows` (even empty); else list `table_rows`."""
+    rows = container.get("rows")
+    if isinstance(rows, list):
+        return rows
+    table_rows = container.get("table_rows")
+    if isinstance(table_rows, list):
+        return table_rows
+    return []
+
+
+def _legacy_numeric_count(value: Any) -> Optional[int]:
+    """Return a genuine numeric row/col count; None for lists/dicts/None/non-numeric strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _bbox_overlap_ratio(
     a: Tuple[float, float, float, float],
     b: Tuple[float, float, float, float],
@@ -47,8 +71,8 @@ def _block_bbox_xywh(block: Dict[str, Any]) -> Optional[Tuple[float, float, floa
 
 def _table_geometry_stats(table: Dict[str, Any], side: str) -> Dict[str, Any]:
     """Logical grid vs physical cells — never count empty span placeholders as physical."""
-    rows_list = table.get("table_rows") or []
-    grid_rows = len(rows_list) if isinstance(rows_list, list) else 0
+    rows_list = _canonical_rows_grid(table)
+    grid_rows = len(rows_list)
     grid_cols = max((len(r) for r in rows_list if isinstance(r, list)), default=0)
 
     raw_cells = table.get("cells_raw")
@@ -83,11 +107,13 @@ def _table_geometry_stats(table: Dict[str, Any], side: str) -> Dict[str, Any]:
                  for c in raw_cells if isinstance(c, dict)),
                 default=0,
             )
-        # Also honor explicit rows/cols on block
-        if table.get("rows"):
-            grid_rows = int(table.get("rows") or grid_rows)
-        if table.get("cols"):
-            grid_cols = int(table.get("cols") or grid_cols)
+        # Honor explicit NUMERIC rows/cols counts only (never int() a 2D grid).
+        legacy_rows = _legacy_numeric_count(table.get("rows"))
+        if legacy_rows:
+            grid_rows = legacy_rows
+        legacy_cols = _legacy_numeric_count(table.get("cols"))
+        if legacy_cols:
+            grid_cols = legacy_cols
     else:
         # Legacy (or v2 without cells): count non-empty text slots as split units.
         physical = 0
@@ -118,21 +144,18 @@ def collect_legacy_tables(kb: Dict[str, Any]) -> List[Dict[str, Any]]:
         for bi, block in enumerate(entry.get("blocks") or []):
             if not isinstance(block, dict) or block.get("type") != "table":
                 continue
-            rows = block.get("table_rows") or block.get("rows") or []
-            # legacy block.rows may be int count — normalize
-            if isinstance(rows, int):
-                rows = block.get("table_rows") or []
+            grid = _canonical_rows_grid(block)
             nonempty = 0
-            for row in rows:
+            for row in grid:
                 if isinstance(row, list):
                     nonempty += sum(1 for c in row if _norm_text(c))
             stats = _table_geometry_stats(
                 {
-                    "table_rows": rows,
+                    "table_rows": grid,
                     "cells": block.get("cells"),
                     "cells_raw": None,
-                    "rows": None,
-                    "cols": None,
+                    "rows": _legacy_numeric_count(block.get("rows")),
+                    "cols": _legacy_numeric_count(block.get("cols")),
                 },
                 side="legacy",
             )
@@ -144,12 +167,10 @@ def collect_legacy_tables(kb: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "id": block.get("id"),
                     "page_number": int(block.get("pageNumber") or 0),
                     "bbox": _block_bbox_xywh(block),
-                    "rows": stats["logical_rows"] or (len(rows) if isinstance(rows, list) else 0),
+                    "rows": stats["logical_rows"] or len(grid),
                     "cols": stats["logical_cols"],
                     "nonempty_cells": nonempty,
-                    "table_rows": [[str(c) for c in r] if isinstance(r, list) else [] for r in rows]
-                    if isinstance(rows, list)
-                    else [],
+                    "table_rows": [[str(c) for c in r] if isinstance(r, list) else [] for r in grid],
                     "cells_raw": None,  # legacy has no geometric cells → span unavailable
                     "geometry": stats,
                 }
@@ -164,21 +185,21 @@ def collect_v2_tables(kb: Dict[str, Any]) -> List[Dict[str, Any]]:
         for bi, block in enumerate(entry.get("blocks") or []):
             if not isinstance(block, dict) or block.get("type") != "table":
                 continue
-            rows = block.get("table_rows") or []
+            grid = _canonical_rows_grid(block)
             cells = block.get("cells")
             stats = _table_geometry_stats(
                 {
-                    "table_rows": rows,
+                    "table_rows": grid,
                     "cells": cells,
-                    "rows": block.get("rows"),
-                    "cols": block.get("cols"),
+                    "rows": _legacy_numeric_count(block.get("rows")),
+                    "cols": _legacy_numeric_count(block.get("cols")),
                 },
                 side="v2",
             )
             nonempty = stats["nonempty_cells"]
             if not stats["span_data_available"]:
                 nonempty = 0
-                for row in rows:
+                for row in grid:
                     if isinstance(row, list):
                         nonempty += sum(1 for c in row if _norm_text(c))
             tables.append(
@@ -189,12 +210,10 @@ def collect_v2_tables(kb: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "id": block.get("id"),
                     "page_number": int(block.get("pageNumber") or 0),
                     "bbox": _block_bbox_xywh(block),
-                    "rows": stats["logical_rows"] or (len(rows) if isinstance(rows, list) else 0),
+                    "rows": stats["logical_rows"] or len(grid),
                     "cols": stats["logical_cols"],
                     "nonempty_cells": nonempty,
-                    "table_rows": [[str(c) for c in r] if isinstance(r, list) else [] for r in rows]
-                    if isinstance(rows, list)
-                    else [],
+                    "table_rows": [[str(c) for c in r] if isinstance(r, list) else [] for r in grid],
                     "cells_raw": cells if isinstance(cells, list) else None,
                     "structureStatus": block.get("structureStatus"),
                     "geometry": stats,

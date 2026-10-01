@@ -21,3 +21,6 @@ Mapping of core functions to their implementation files.
 | `extract_page` | [native_adapter.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/extraction_adapters/native_adapter.py) | Implementation | High-precision native PDF extraction |
 | `detect_blocks` | [layout_adapter.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/extraction_adapters/layout_adapter.py) | Implementation | Visual block detection (tables/figures) |
 | `project` | [semantic_projector.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/semantic_projector.py) | Implementation | Canonical IR to Knowledge Base projection |
+| `_canonical_table_grid` | [main.py](file:///C:/Users/zgz31/Desktop/PaddleModels/src/paddle_models/cli/main.py) | Implementation | Resolve table block canonical 2D grid (prefer list `rows`, else `table_rows`) |
+| `_canonical_rows_grid` | [table_diff.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/compatibility/table_diff.py) | Implementation | Resolve canonical 2D grid for table diff (prefer list `rows`, else `table_rows`) |
+| `_legacy_numeric_count` | [table_diff.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/compatibility/table_diff.py) | Implementation | Return numeric row/col count only; None for lists/dicts/non-numeric |
