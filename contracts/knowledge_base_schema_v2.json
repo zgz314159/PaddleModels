@@ -165,15 +165,22 @@
                     "additionalProperties": false
                   }
                 },
-                "table_rows": {
+                "rows": {
+                  "description": "2D string grid. Structured tables: rectangular grid with anchor text only (spanned slots = empty string). Image-only/unstructured tables: [].",
                   "type": "array",
                   "items": {
                     "type": "array",
                     "items": { "type": "string" }
                   }
                 },
-                "rows": { "type": "integer", "minimum": 1 },
-                "cols": { "type": "integer", "minimum": 1 },
+                "table_rows": {
+                  "description": "LEGACY COMPAT ALIAS ONLY (historical input). New v2 output must not emit this field.",
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                  }
+                },
                 "cells": {
                   "type": "array",
                   "items": {

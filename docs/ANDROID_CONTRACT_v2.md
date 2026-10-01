@@ -17,7 +17,7 @@ Every entry now contains a `blocks` list. Android should prioritize rendering `b
 
 ### Block Types:
 - **`code`**: Used for text segments. Includes `language="markdown"`, `code` (the text), and `semanticRole` (e.g., `heading`, `body`).
-- **`table`**: Represents a visual or structural table. May include `imageUri` (snapshot) and `rows` (2D array of strings).
+- **`table`**: Represents a visual or structural table. Always includes `rows` (a 2D array of strings) and, when structured, `cells`. Image-only tables use an empty `rows` array. The v2 export never writes `table_rows` or an integer row count; `table_rows` remains a legacy input alias only.
 - **`image`**: Represents a figure or drawing. Includes `imageUri`.
 
 ## 3. Coordinate System
