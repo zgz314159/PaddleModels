@@ -1,0 +1,55 @@
+{
+  "document_id": "sample_fixture",
+  "schema_version": "2.0",
+  "pages": [
+    {
+      "page_number": 1,
+      "width": 600,
+      "height": 800,
+      "blocks": [
+        {
+          "id": "sample_b1",
+          "type": "title",
+          "text": "Sample Document Title",
+          "bbox": {
+            "x": 100,
+            "y": 50,
+            "w": 400,
+            "h": 50
+          },
+          "page_number": 1,
+          "reading_order": 0,
+          "confidence": 1.0,
+          "source": "native",
+          "parent_id": null,
+          "metadata": {}
+        },
+        {
+          "id": "sample_b2",
+          "type": "text",
+          "text": "This is a sample paragraph for v2 contract verification.",
+          "bbox": {
+            "x": 100,
+            "y": 120,
+            "w": 400,
+            "h": 100
+          },
+          "page_number": 1,
+          "reading_order": 1,
+          "confidence": 1.0,
+          "source": "native",
+          "parent_id": null,
+          "metadata": {}
+        }
+      ],
+      "tables": [],
+      "images": [],
+      "method": "native",
+      "rotation": 0,
+      "warnings": [],
+      "processing_time_ms": 0.0
+    }
+  ],
+  "metadata": {},
+  "sha256": "dummy_hash"
+}

@@ -12,6 +12,80 @@ the script will still produce a KB with page images and extracted text.
 """
 from __future__ import annotations
 
+import sys
+import os
+import re
+import json
+import base64
+import hashlib
+import time
+import argparse
+import traceback
+import subprocess
+import shutil
+import math
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, Union, Set
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# --- Semantics & Watermark extraction ---
+from pipeline.semantics.role_inference import (
+    infer_text_structure_semantic_role,
+    is_pdf_page_marker_text,
+    looks_like_pdf_attached_numbered_body_item,
+    is_likely_pdf_callout_or_annotation
+)
+from imaging.watermark_utils import (
+    looks_like_repeated_watermark_text as _looks_like_repeated_watermark_text,
+    filter_repeated_watermark_lines as _filter_repeated_watermark_lines,
+    filter_repeated_watermark_text as _filter_repeated_watermark_text,
+    filter_repeated_watermark_dicts as _filter_repeated_watermark_dicts,
+    collect_repeated_watermark_candidates as _collect_repeated_watermark_candidates,
+)
+
+# --- Bbox & Vision utilities ---
+from imaging.bbox_utils import (
+    clip_xywh_to_page as _clip_xywh_to_page,
+    bbox_overlap_1d as _bbox_overlap_1d,
+    bbox_gap_1d as _bbox_gap_1d,
+    coerce_bbox_to_xywh as _coerce_bbox_to_xywh,
+    xywh_to_bbox_dict as _xywh_to_bbox_dict,
+    bbox_overlap_ratio_xywh as _bbox_overlap_ratio_xywh,
+    bbox_center_inside_region as _bbox_center_inside_region,
+    bbox_iou_xywh as _bbox_iou_xywh,
+    bbox_inside_xywh as _bbox_inside_xywh,
+    bbox_coverage_xywh as _bbox_coverage_xywh,
+)
+from imaging.vision_utils import (
+    build_visual_signal_mask as _build_visual_signal_mask,
+    count_line_intersections as _count_line_intersections,
+    page_has_structural_visual_signal as _page_has_structural_visual_signal,
+)
+from imaging.layout_refiner import (
+    collect_top_semantic_constraints as _collect_top_semantic_constraints,
+    suppress_nested_figure_boxes as _suppress_nested_figure_boxes,
+    suppress_compound_parent_figure_boxes as _suppress_compound_parent_figure_boxes,
+    is_nested_figure_fragment as _is_nested_figure_fragment,
+    prune_overlapping_boxes as _prune_overlapping_boxes,
+    suppress_redundant_layout_figure_blocks as _suppress_redundant_layout_figure_blocks,
+    merge_sidecar_figure_boxes as _merge_sidecar_figure_boxes,
+    merge_stacked_table_boxes as _merge_stacked_table_boxes,
+    pad_visual_bbox as _pad_visual_bbox,
+    clamp_visual_bbox_growth as _clamp_visual_bbox_growth,
+    trim_visual_bbox_with_text_boxes as _trim_visual_bbox_with_text_boxes,
+    refine_visual_bbox_from_pixels as _refine_visual_bbox_from_pixels,
+    iteratively_refine_visual_bbox as _iteratively_refine_visual_bbox,
+    expand_refined_figure_bbox_with_support_boxes as _expand_refined_figure_bbox_with_support_boxes,
+    clamp_padded_figure_bbox_to_support_band as _clamp_padded_figure_bbox_to_support_band,
+    clamp_padded_figure_bbox_to_avoidance_constraints as _clamp_padded_figure_bbox_to_avoidance_constraints,
+    trim_visual_bbox_with_image_rows as _trim_visual_bbox_with_image_rows,
+    shrink_visual_bbox_to_blank_edges as _shrink_visual_bbox_to_blank_edges,
+    figure_box_looks_self_contained as _figure_box_looks_self_contained,
+)
+
 # Utility: robust UTF logger that always writes to stderr to avoid stdout pollution
 def _print_utf(msg: str) -> None:
     """Write a UTF-8-safe message to stderr without using built-in print.
@@ -198,8 +272,6 @@ TEXT_TRIM_MARGIN_PX = 6
 VISUAL_BBOX_PAD_PX = 8
 YOLO_LAYOUT_DEFAULT_CONF = 0.18
 YOLO_LAYOUT_DEFAULT_IMGSZ = 1600
-REPEATED_WATERMARK_MIN_PAGES = 3
-REPEATED_WATERMARK_MAX_THRESHOLD = 12
 _PADDLE_OCR_INSTANCE = None
 _PADDLE_OCR_INSTANCE_INIT_FAILED = False
 _PADDLE_OCR_LOCK = threading.RLock()
@@ -226,173 +298,6 @@ def _get_shared_paddle_ocr() -> Optional[object]:
             return None
         return _PADDLE_OCR_INSTANCE
 
-
-def _normalize_repeated_watermark_text(text: str) -> str:
-    raw = str(text or '').strip()
-    if not raw:
-        return ''
-    compact = re.sub(r'[\s\-_—–~〜·•,，.。:：;；|/\\]+', '', raw)
-    compact = compact.replace('（', '').replace('）', '').replace('(', '').replace(')', '')
-    return compact.strip()
-
-
-def _is_plausible_repeated_watermark_text(text: str) -> bool:
-    compact = _normalize_repeated_watermark_text(text)
-    if not compact:
-        return False
-    if len(compact) < 5 or len(compact) > 24:
-        return False
-    if re.search(r'[。！？!?；;]', str(text or '')):
-        return False
-    if re.match(r'^(图|表)\s*[0-9一二三四五六七八九十零〇\-—_.．]+', compact, flags=re.IGNORECASE):
-        return False
-    if re.match(r'^第[一二三四五六七八九十百零〇0-9]+[章节]', compact):
-        return False
-    if re.match(r'^[一二三四五六七八九十]+、', compact):
-        return False
-    digit_count = len(re.findall(r'\d', compact))
-    cjk_count = len(re.findall(r'[\u4e00-\u9fff]', compact))
-    alpha_count = len(re.findall(r'[A-Za-z]', compact))
-    if digit_count < 3:
-        return False
-    if cjk_count + alpha_count < 1:
-        return False
-    if cjk_count > 10:
-        return False
-    return True
-
-
-def _looks_like_repeated_watermark_text(text: str, repeated_candidates: Optional[Set[str]]) -> bool:
-    compact = _normalize_repeated_watermark_text(text)
-    if not compact or not repeated_candidates:
-        return False
-    text_digits = ''.join(re.findall(r'\d', compact))
-    text_is_alpha_cjk = bool(re.fullmatch(r'[\u4e00-\u9fffA-Za-z]+', compact))
-    for candidate in repeated_candidates:
-        cand = _normalize_repeated_watermark_text(candidate)
-        if not cand:
-            continue
-        cand_digits = ''.join(re.findall(r'\d', cand))
-        if compact == cand:
-            return True
-        if compact in cand and len(compact) >= max(5, int(len(cand) * 0.45)):
-            return True
-        if text_is_alpha_cjk and cand.startswith(compact) and len(compact) >= 3:
-            return True
-        if cand in compact and len(cand) >= 5 and (len(compact) - len(cand)) <= 2:
-            return True
-        if (
-            text_digits
-            and len(text_digits) >= 3
-            and text_digits in cand_digits
-            and len(compact) <= 8
-            and re.search(r'[\u4e00-\u9fffA-Za-z]', compact)
-        ):
-            return True
-    return False
-
-
-def _filter_repeated_watermark_lines(lines: List[str], repeated_candidates: Optional[Set[str]]) -> List[str]:
-    if not repeated_candidates:
-        return [str(line or '').strip() for line in (lines or []) if str(line or '').strip()]
-    filtered: List[str] = []
-    for line in lines or []:
-        line_text = str(line or '').strip()
-        if not line_text:
-            continue
-        if _looks_like_repeated_watermark_text(line_text, repeated_candidates):
-            continue
-        filtered.append(line_text)
-    return filtered
-
-
-def _filter_repeated_watermark_text(text: str, repeated_candidates: Optional[Set[str]]) -> str:
-    raw = str(text or '')
-    if not raw:
-        return ''
-    lines = raw.splitlines()
-    filtered = _filter_repeated_watermark_lines(lines, repeated_candidates)
-    return '\n'.join(filtered)
-
-
-def _filter_repeated_watermark_dicts(items: List[Dict], repeated_candidates: Optional[Set[str]]) -> List[Dict]:
-    if not repeated_candidates:
-        return list(items or [])
-    filtered: List[Dict] = []
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get('text') or item.get('code') or item.get('contentMarkdown') or '').strip()
-        if text and _looks_like_repeated_watermark_text(text, repeated_candidates):
-            continue
-        filtered.append(item)
-    return filtered
-
-
-def _collect_repeated_watermark_candidates(doc: fitz.Document) -> Set[str]:
-    page_hits: Dict[str, Set[int]] = {}
-    try:
-        page_count = int(getattr(doc, 'page_count', 0) or 0)
-    except Exception:
-        page_count = 0
-    if page_count <= 0:
-        return set()
-
-    threshold = max(
-        REPEATED_WATERMARK_MIN_PAGES,
-        min(REPEATED_WATERMARK_MAX_THRESHOLD, max(REPEATED_WATERMARK_MIN_PAGES, (page_count + 9) // 10)),
-    )
-
-    for page_index in range(page_count):
-        try:
-            page = doc.load_page(page_index)
-            data = page.get_text('dict') or {}
-        except Exception:
-            continue
-        blocks = data.get('blocks') if isinstance(data, dict) else None
-        if not isinstance(blocks, list):
-            continue
-        page_seen: Set[str] = set()
-        for blk in blocks:
-            if not isinstance(blk, dict) or int(blk.get('type', 0)) != 0:
-                continue
-            lines = blk.get('lines') if isinstance(blk.get('lines'), list) else []
-            for line in lines:
-                if not isinstance(line, dict):
-                    continue
-                spans = line.get('spans') if isinstance(line.get('spans'), list) else []
-                span_texts: List[str] = []
-                for span in spans:
-                    if not isinstance(span, dict):
-                        continue
-                    txt = str(span.get('text') or '').strip()
-                    if not txt:
-                        continue
-                    span_texts.append(txt)
-                    compact = _normalize_repeated_watermark_text(txt)
-                    if _is_plausible_repeated_watermark_text(compact):
-                        page_seen.add(compact)
-                line_text = ' '.join(span_texts).strip()
-                compact_line = _normalize_repeated_watermark_text(line_text)
-                if _is_plausible_repeated_watermark_text(compact_line):
-                    page_seen.add(compact_line)
-        for text in page_seen:
-            page_hits.setdefault(text, set()).add(page_index + 1)
-
-    repeated = {
-        text
-        for text, pages in page_hits.items()
-        if len(pages) >= threshold
-    }
-    if repeated:
-        try:
-            sample = ', '.join(sorted(repeated, key=lambda item: (-len(item), item))[:6])
-            _print_utf(
-                f"[WATERMARK] repeated_text_candidates={len(repeated)} threshold={threshold} samples={sample}"
-            )
-        except Exception:
-            pass
-    return repeated
 
 
 def _collect_dynamic_page_artifact_signatures(doc: fitz.Document) -> Set[str]:
@@ -488,7 +393,7 @@ def _looks_like_dynamic_page_artifact(
     text: str,
     *,
     zone: Optional[str],
-    dynamic_artifact_signatures: Optional[Set[str]],
+    dynamic_artifact_signatures: Optional[set],
 ) -> bool:
     if not dynamic_artifact_signatures or not zone:
         return False
@@ -610,7 +515,7 @@ def _normalize_layout_constraint_type(label: Any) -> str:
     return ''
 
 
-def _coerce_layout_items(layout_res: Any) -> Optional[List[Any]]:
+def _coerce_layout_items(layout_res: Any) -> Optional[list]:
     items = None
     try:
         if isinstance(layout_res, list):
@@ -819,57 +724,6 @@ def _write_layout_debug_page(
         _print_utf(f"[WARN] Failed to write layout debug page dump for p{page_num}: {ex}")
 
 
-def _clip_xywh_to_page(x: int, y: int, w: int, h: int, page_w: int, page_h: int) -> Tuple[int, int, int, int]:
-    x = int(max(0, min(x, max(0, page_w - 1))))
-    y = int(max(0, min(y, max(0, page_h - 1))))
-    w = int(max(1, min(w, max(1, page_w - x))))
-    h = int(max(1, min(h, max(1, page_h - y))))
-    return (x, y, w, h)
-
-
-def _bbox_overlap_1d(a0: int, a1: int, b0: int, b1: int) -> int:
-    return max(0, min(a1, b1) - max(a0, b0))
-
-
-def _bbox_gap_1d(a0: int, a1: int, b0: int, b1: int) -> int:
-    return max(0, max(a0, b0) - min(a1, b1))
-
-
-def _coerce_bbox_to_xywh(bbox: Any) -> Optional[Tuple[int, int, int, int]]:
-    if isinstance(bbox, dict):
-        try:
-            if {'left', 'top', 'right', 'bottom'}.issubset(set(bbox.keys())):
-                left = int(round(float(bbox.get('left', 0))))
-                top = int(round(float(bbox.get('top', 0))))
-                right = int(round(float(bbox.get('right', left))))
-                bottom = int(round(float(bbox.get('bottom', top))))
-                return (left, top, max(1, right - left), max(1, bottom - top))
-            if {'x0', 'y0', 'x1', 'y1'}.issubset(set(bbox.keys())):
-                x0 = int(round(float(bbox.get('x0', 0))))
-                y0 = int(round(float(bbox.get('y0', 0))))
-                x1 = int(round(float(bbox.get('x1', x0))))
-                y1 = int(round(float(bbox.get('y1', y0))))
-                return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
-            if {'x', 'y', 'w', 'h'}.issubset(set(bbox.keys())):
-                x = int(round(float(bbox.get('x', 0))))
-                y = int(round(float(bbox.get('y', 0))))
-                w = int(round(float(bbox.get('w', 0))))
-                h = int(round(float(bbox.get('h', 0))))
-                if w > 0 and h > 0:
-                    return (x, y, w, h)
-        except Exception:
-            return None
-    elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-        try:
-            vals = [int(round(float(v))) for v in bbox[:4]]
-            if vals[2] > vals[0] and vals[3] > vals[1]:
-                return (vals[0], vals[1], vals[2] - vals[0], vals[3] - vals[1])
-            if vals[2] > 0 and vals[3] > 0:
-                return (vals[0], vals[1], vals[2], vals[3])
-        except Exception:
-            return None
-    return None
-
 
 def _collect_layout_support_boxes(layout_items: Any) -> List[Dict[str, Any]]:
     items = _coerce_layout_items(layout_items)
@@ -937,315 +791,151 @@ def _collect_layout_avoidance_constraints(layout_items: Any) -> List[Dict[str, A
     return out
 
 
-def _collect_top_semantic_constraints(
-    native_text_line_boxes: Optional[List[Dict]],
-    avoidance_constraints: Optional[List[Dict]],
-    native_text_boxes: Optional[List[Dict]] = None,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    seen: Set[Tuple[str, int, int, int, int]] = set()
+def _detect_top_text_band_cut(
+    page_cv,
+    bbox: Tuple[int, int, int, int],
+) -> Optional[int]:
+    if page_cv is None or not (_HAS_NUMPY and _HAS_CV2):
+        return None
+    try:
+        ph, pw = page_cv.shape[:2]
+        x, y, w, h = _clip_xywh_to_page(*bbox, pw, ph)
+        if w < 120 or h < 120:
+            return None
 
-    for line_box in native_text_line_boxes or []:
-        try:
-            x, y, w, h = line_box.get('bbox', (0, 0, 0, 0))
-        except Exception:
-            continue
-        if w <= 0 or h <= 0:
-            continue
-        key = ('pdf_text_line', int(x), int(y), int(w), int(h))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            'type': 'text',
-            'bbox': (int(x), int(y), int(w), int(h)),
-            'source': 'pdf_text_line',
-            'text': str(line_box.get('text') or ''),
-        })
+        band_h = max(34, min(120, int(float(h) * 0.22)))
+        roi = page_cv[y:y + band_h, x:x + w]
+        if roi is None or getattr(roi, 'size', 0) == 0:
+            return None
 
-    if not out:
-        for text_box in native_text_boxes or []:
-            try:
-                x, y, w, h = text_box.get('bbox', (0, 0, 0, 0))
-            except Exception:
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        inv = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            9,
+        )
+        kernel_w = max(18, min(72, int(float(w) * 0.10)))
+        text_lines = cv2.morphologyEx(
+            inv,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 3)),
+            iterations=1,
+        )
+        text_lines = cv2.morphologyEx(
+            text_lines,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2)),
+            iterations=1,
+        )
+
+        contours, _hier = cv2.findContours(text_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        text_bottom = -1
+        for cnt in contours:
+            lx, ly, lw, lh = cv2.boundingRect(cnt)
+            if lw < max(28, int(float(w) * 0.18)):
                 continue
-            if w <= 0 or h <= 0:
+            if lh > max(26, int(float(band_h) * 0.55)):
                 continue
-            key = ('pdf_text_box', int(x), int(y), int(w), int(h))
-            if key in seen:
+            if ly > max(24, int(float(band_h) * 0.42)):
                 continue
-            seen.add(key)
-            out.append({
-                'type': 'text',
-                'bbox': (int(x), int(y), int(w), int(h)),
-                'source': 'pdf_text_box',
-                'text': str(text_box.get('text') or ''),
-            })
+            patch = text_lines[ly:ly + lh, lx:lx + lw]
+            if patch is None or patch.size == 0:
+                continue
+            fill = float(cv2.countNonZero(patch)) / float(max(1, lw * lh))
+            if fill < 0.045:
+                continue
+            text_bottom = max(text_bottom, ly + lh)
 
-    for constraint in avoidance_constraints or []:
-        try:
-            x, y, w, h = constraint.get('bbox', (0, 0, 0, 0))
-        except Exception:
-            continue
-        if w <= 0 or h <= 0:
-            continue
-        source = str(constraint.get('source') or 'layout').lower()
-        constraint_type = str(constraint.get('type') or 'text').lower()
-        key = (f'{source}:{constraint_type}', int(x), int(y), int(w), int(h))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            'type': constraint_type,
-            'bbox': (int(x), int(y), int(w), int(h)),
-            'source': source,
-        })
-
-    return out
+        if text_bottom <= 0:
+            return None
+        candidate_top = y + int(text_bottom) + TEXT_TRIM_MARGIN_PX
+        if candidate_top >= y + max(80, int(float(h) * 0.36)):
+            return None
+        return candidate_top
+    except Exception:
+        return None
 
 
-def _collect_relevant_figure_support_regions(
+def _should_trace_avoidance_debug(debug_context: str = '') -> bool:
+    try:
+        trace_flag = str(os.environ.get('PDF_AVOIDANCE_TRACE') or '').strip().lower()
+        if trace_flag not in {'1', 'true', 'yes', 'on'}:
+            return False
+        trace_filter = str(os.environ.get('PDF_AVOIDANCE_TRACE_FILTER') or '').strip()
+        if trace_filter and trace_filter not in (debug_context or ''):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _trace_avoidance_debug(debug_context: str, message: str) -> None:
+    if not _should_trace_avoidance_debug(debug_context):
+        return
+    try:
+        prefix = f"[TRACE-AVOID] {debug_context}".strip()
+        _print_utf(f"{prefix} {message}".strip())
+    except Exception:
+        pass
+
+
+def _reconcile_figure_split_boxes(
     parent_bbox: Tuple[int, int, int, int],
-    page_text_boxes: List[Dict],
-    layout_support_boxes: Optional[List[Dict]] = None,
+    split_boxes: List[Tuple[int, int, int, int]],
+    page_text_boxes: list,
+    layout_support_boxes: Optional[list] = None,
+    page_cv=None,
 ) -> List[Tuple[int, int, int, int]]:
-    px, py, pw, ph = parent_bbox
-    px1 = px + pw
-    py1 = py + ph
-    caption_margin = max(70, int(ph * 0.25))
-    relevant: List[Tuple[int, int, int, int]] = []
+    if len(split_boxes) <= 1:
+        return split_boxes
+    try:
+        split_boxes = _suppress_nested_figure_boxes(split_boxes)
+        if len(split_boxes) <= 1:
+            return split_boxes
+        if page_cv is not None:
+            for child in split_boxes:
+                if not _figure_box_looks_self_contained(page_cv, child):
+                    return [parent_bbox]
+        return split_boxes
+    except Exception:
+        return [parent_bbox]
 
-    for tb in page_text_boxes or []:
+
+def _is_duplicate_crop_candidate(
+    candidate: Tuple[int, int, int, int],
+    kept_boxes: List[Tuple[int, int, int, int]],
+) -> bool:
+    if not kept_boxes:
+        return False
+    try:
+        cand_area = float(max(1, candidate[2] * candidate[3]))
+    except Exception:
+        return False
+    for kept in kept_boxes:
         try:
-            if not _is_caption_like_text_block(tb, pw):
-                continue
-            tx, ty, tw, th = tb.get('bbox', (0, 0, 0, 0))
-            tx1 = tx + tw
-            ty1 = ty + th
-            x_overlap = _bbox_overlap_1d(px, px1, tx, tx1)
-            if x_overlap < max(40, int(min(tw, pw) * 0.35)):
-                continue
-            if ty > py1 + caption_margin:
-                continue
-            if ty1 < py + int(ph * 0.35):
-                continue
-            relevant.append((int(tx), int(ty), int(tw), int(th)))
+            kept_area = float(max(1, kept[2] * kept[3]))
+            iou = _bbox_iou_xywh(candidate, kept)
+            if iou >= 0.84:
+                return True
+            area_ratio = min(cand_area, kept_area) / max(cand_area, kept_area)
+            if area_ratio >= 0.78 and (
+                _bbox_inside_xywh(candidate, kept, margin=10)
+                or _bbox_inside_xywh(kept, candidate, margin=10)
+            ):
+                return True
         except Exception:
             continue
+    return False
 
-    support_h_max = max(72, int(ph * 0.18))
-    support_margin = max(caption_margin, int(ph * 0.30))
-    support_top_limit = py + int(ph * 0.30)
-    for support in layout_support_boxes or []:
-        try:
-            tx, ty, tw, th = support.get('bbox', (0, 0, 0, 0))
-            if tw <= 0 or th <= 0 or th > support_h_max:
-                continue
-            tx1 = tx + tw
-            ty1 = ty + th
-            if ty > py1 + support_margin:
-                continue
-            if ty1 < support_top_limit:
-                continue
-            x_overlap = _bbox_overlap_1d(px, px1, tx, tx1)
-            center_delta = abs((float(tx) + float(tx1)) * 0.5 - (float(px) + float(px1)) * 0.5)
-            if x_overlap < max(28, int(min(tw, pw) * 0.18)) and center_delta > max(float(pw) * 0.42, float(tw) * 0.85):
-                continue
-            relevant.append((int(tx), int(ty), int(tw), int(th)))
-        except Exception:
-            continue
-
-    deduped: List[Tuple[int, int, int, int]] = []
-    seen_boxes: Set[Tuple[int, int, int, int]] = set()
-    for box in sorted(relevant, key=lambda b: (b[1], b[0], b[2], b[3])):
-        if box in seen_boxes:
-            continue
-        seen_boxes.add(box)
-        deduped.append(box)
-    return deduped
-
-
-def _expand_refined_figure_bbox_with_support_boxes(
-    anchor_bbox: Tuple[int, int, int, int],
-    candidate_bbox: Tuple[int, int, int, int],
-    layout_support_boxes: List[Dict],
-    page_w: int,
-    page_h: int,
-) -> Tuple[int, int, int, int]:
-    if not layout_support_boxes:
-        return candidate_bbox
-    try:
-        ax, ay, aw, ah = anchor_bbox
-        cx, cy, cw, ch = candidate_bbox
-
-        relevant = _collect_relevant_figure_support_regions(anchor_bbox, [], layout_support_boxes)
-        if not relevant:
-            return candidate_bbox
-
-        cx1 = cx + cw
-        cy1 = cy + ch
-        ax1 = ax + aw
-        ay1 = ay + ah
-        support_gap_max = max(96, int(ah * 0.18), int(ch * 0.28))
-        support_band_gap = max(24, int(ah * 0.07))
-        support_bottom_limit = min(page_h, max(ay1, cy1 + support_gap_max))
-        selected: List[Tuple[int, int, int, int]] = []
-        band_bottom = cy1
-
-        for tx, ty, tw, th in sorted(relevant, key=lambda b: (b[1], b[0])):
-            if ty + th < cy + int(ch * 0.45):
-                continue
-            gap_y = ty - cy1
-            if gap_y > support_gap_max:
-                continue
-            if ty > support_bottom_limit:
-                continue
-            x_overlap = _bbox_overlap_1d(cx, cx1, tx, tx + tw)
-            anchor_overlap = _bbox_overlap_1d(ax, ax1, tx, tx + tw)
-            center_delta = abs((float(tx) + float(tx + tw)) * 0.5 - (float(cx) + float(cx1)) * 0.5)
-            if x_overlap < max(24, int(min(cw, tw) * 0.16)):
-                if anchor_overlap < max(32, int(min(aw, tw) * 0.22)):
-                    continue
-                if center_delta > max(float(cw) * 0.60, float(tw) * 0.85):
-                    continue
-            if selected and ty > band_bottom + support_band_gap:
-                break
-            selected.append((tx, ty, tw, th))
-            band_bottom = max(band_bottom, ty + th)
-
-        if not selected:
-            return candidate_bbox
-
-        nx0 = cx
-        nx1 = cx1
-        ny1 = cy1
-        x_pad = max(8, int(float(aw) * 0.02))
-        min_x = max(0, ax - x_pad)
-        max_x1 = min(page_w, ax1 + x_pad)
-        for tx, ty, tw, th in selected:
-            nx0 = min(nx0, tx)
-            nx1 = max(nx1, tx + tw)
-            ny1 = max(ny1, ty + th)
-        nx0 = max(min_x, nx0)
-        nx1 = min(max_x1, nx1)
-        ny1 = min(page_h, ny1)
-        return _clip_xywh_to_page(int(nx0), int(cy), int(nx1 - nx0), int(ny1 - cy), page_w, page_h)
-    except Exception:
-        return candidate_bbox
-
-
-def _clamp_padded_figure_bbox_to_support_band(
-    padded_bbox: Tuple[int, int, int, int],
-    unpadded_bbox: Tuple[int, int, int, int],
-    layout_support_boxes: List[Dict],
-    page_w: int,
-    page_h: int,
-) -> Tuple[int, int, int, int]:
-    if not layout_support_boxes:
-        return padded_bbox
-    try:
-        px, py, pw, ph = padded_bbox
-        ux, uy, uw, uh = unpadded_bbox
-        ux1 = ux + uw
-        uy1 = uy + uh
-        matched: List[Tuple[int, int, int, int]] = []
-        for support in layout_support_boxes:
-            sx, sy, sw, sh = support.get('bbox', (0, 0, 0, 0))
-            if sw <= 0 or sh <= 0:
-                continue
-            if sy < uy + int(uh * 0.55):
-                continue
-            if abs((sy + sh) - uy1) > max(10, int(sh * 0.60), TEXT_TRIM_MARGIN_PX + 2):
-                continue
-            x_overlap = _bbox_overlap_1d(ux, ux1, sx, sx + sw)
-            if x_overlap < max(24, int(min(uw, sw) * 0.16)):
-                continue
-            matched.append((int(sx), int(sy), int(sw), int(sh)))
-        if not matched:
-            return padded_bbox
-        keep_bottom = max(sy + sh for _sx, sy, _sw, sh in matched) + max(4, TEXT_TRIM_MARGIN_PX)
-        current_bottom = py + ph
-        if keep_bottom >= current_bottom:
-            return padded_bbox
-        return _clip_xywh_to_page(int(px), int(py), int(pw), int(keep_bottom - py), page_w, page_h)
-    except Exception:
-        return padded_bbox
-
-
-def _clamp_padded_figure_bbox_to_avoidance_constraints(
-    padded_bbox: Tuple[int, int, int, int],
-    unpadded_bbox: Tuple[int, int, int, int],
-    avoidance_constraints: Optional[List[Dict]],
-    page_w: int,
-    page_h: int,
-    debug_context: str = '',
-) -> Tuple[int, int, int, int]:
-    if not avoidance_constraints:
-        return padded_bbox
-    try:
-        px, py, pw, ph = padded_bbox
-        ux, uy, uw, uh = unpadded_bbox
-        if pw <= 0 or ph <= 0 or uw <= 0 or uh <= 0:
-            return padded_bbox
-
-        padded_bottom = py + ph
-        unpadded_bottom = uy + uh
-        min_overlap_px = max(48, int(float(max(pw, uw)) * 0.40))
-        nearest_text_top: Optional[int] = None
-
-        for constraint in avoidance_constraints or []:
-            try:
-                tx, ty, tw, th = constraint.get('bbox', (0, 0, 0, 0))
-            except Exception:
-                continue
-            if tw <= 0 or th <= 0:
-                continue
-            if ty < unpadded_bottom:
-                continue
-            if ty >= padded_bottom:
-                continue
-
-            x_overlap = _bbox_overlap_1d(px, px + pw, tx, tx + tw)
-            crop_overlap_ratio = float(x_overlap) / float(max(1, pw))
-            text_overlap_ratio = float(x_overlap) / float(max(1, tw))
-            if x_overlap < min_overlap_px:
-                continue
-            if crop_overlap_ratio < 0.40:
-                continue
-            if text_overlap_ratio < 0.30:
-                continue
-
-            if nearest_text_top is None or int(ty) < nearest_text_top:
-                nearest_text_top = int(ty)
-
-        if nearest_text_top is None:
-            return padded_bbox
-
-        keep_bottom = min(int(padded_bottom), int(nearest_text_top) - TEXT_TRIM_MARGIN_PX)
-        if keep_bottom <= py:
-            keep_bottom = min(int(padded_bottom), int(nearest_text_top))
-        if keep_bottom <= py:
-            return padded_bbox
-        if keep_bottom >= padded_bottom:
-            return padded_bbox
-
-        clamped = _clip_xywh_to_page(int(px), int(py), int(pw), int(keep_bottom - py), page_w, page_h)
-        try:
-            _trace_avoidance_debug(
-                debug_context,
-                f"stage=post_pad_avoidance_clamp top={nearest_text_top} old={padded_bottom} new={clamped[1] + clamped[3]}",
-            )
-        except Exception:
-            pass
-        return clamped
-    except Exception:
-        return padded_bbox
 
 
 def _extract_pdf_text_boxes(
     page: fitz.Page,
-    repeated_watermark_candidates: Optional[Set[str]] = None,
-    dynamic_artifact_signatures: Optional[Set[str]] = None,
+    repeated_watermark_candidates: Optional[set] = None,
+    dynamic_artifact_signatures: Optional[set] = None,
 ) -> List[Dict]:
     """Extract text block boxes from the native PDF layout for crop trimming."""
     out: List[Dict] = []
@@ -1313,7 +1003,6 @@ def _extract_pdf_text_boxes(
                 if total_chars_in_blk > 0 and (bold_chars_in_blk / total_chars_in_blk) < 0.85:
                     use_inline_bold = True
 
-            collected_spans: List[Dict] = []
             for line in lines:
                 if not isinstance(line, dict):
                     continue
@@ -1326,21 +1015,12 @@ def _extract_pdf_text_boxes(
                         flags = int(span.get('flags', 0))
                         is_bold = bool(flags & 16)
 
-                        s_bbox = span.get('bbox')
-                        if isinstance(s_bbox, (list, tuple)) and len(s_bbox) >= 4:
-                            sx0, sy0, sx1, sy1 = s_bbox[:4]
-                            s_dict = _xywh_to_bbox_dict(int(round(sx0)), int(round(sy0)), int(round(sx1 - sx0)), int(round(sy1 - sy0)))
-                        else:
-                            s_dict = None
-
                         if use_inline_bold and is_bold:
                             # Avoid double bolding if already has **
                             if not (txt.startswith('**') and txt.endswith('**')):
                                 txt = f"**{txt}**"
 
                         spans_text.append(txt)
-                        if s_dict:
-                            collected_spans.append({'text': txt, 'bbox': s_dict})
 
             text = ' '.join(spans_text).strip()
             if _looks_like_repeated_watermark_text(text, repeated_watermark_candidates):
@@ -1367,14 +1047,13 @@ def _extract_pdf_text_boxes(
                 'avg_line_len': avg_line_len,
                 'font_size': max_font_size,
                 'is_bold': is_any_span_bold,
-                'spans': collected_spans,
             })
     except Exception:
         return out
     return out
 
 
-def _extract_pdf_text_line_boxes(page: fitz.Page, repeated_watermark_candidates: Optional[Set[str]] = None) -> List[Dict]:
+def _extract_pdf_text_line_boxes(page: fitz.Page, repeated_watermark_candidates: Optional[set] = None) -> List[Dict]:
     out: List[Dict] = []
     try:
         data = page.get_text('dict') or {}
@@ -1427,7 +1106,7 @@ def _extract_pdf_text_line_boxes(page: fitz.Page, repeated_watermark_candidates:
 
 def _clamp_figure_bbox_to_top_semantic_ceiling(
     bbox: Tuple[int, int, int, int],
-    top_semantic_constraints: Optional[List[Dict]],
+    top_semantic_constraints: Optional[list],
     page_w: int,
     page_h: int,
     page_cv=None,
@@ -1505,169 +1184,7 @@ def _clamp_figure_bbox_to_top_semantic_ceiling(
         return clamped
     except Exception:
         return bbox
-    return out
 
-
-def _xywh_to_bbox_dict(x: int, y: int, w: int, h: int) -> Dict[str, int]:
-    return {
-        'left': int(x),
-        'top': int(y),
-        'right': int(x + w),
-        'bottom': int(y + h),
-        'width': int(w),
-        'height': int(h),
-    }
-
-
-def _infer_text_structure_semantic_role(tb: Dict) -> str:
-    try:
-        text = str(tb.get('text') or '').strip()
-        compact = re.sub(r'\s+', '', text)
-        line_count = int(tb.get('line_count') or 0)
-        avg_line_len = float(tb.get('avg_line_len') or 0.0)
-        bbox = tb.get('bbox') if isinstance(tb.get('bbox'), (tuple, list)) else None
-        if not compact:
-            return 'artifact'
-        if re.match(r'^(图|表)\s*[0-9一二三四五六七八九十零〇\-—_.．]+', compact, flags=re.IGNORECASE):
-            if len(compact) >= 48 and re.search(
-                r'(如图所示|一般应用|其特点|特点是|传统的|需要强调|当电力|系指)',
-                compact,
-            ):
-                return 'body'
-            return 'caption'
-        if any(token in compact for token in ('示例图', '示意图', '安装图', '布置图', '接线图')):
-            return 'caption'
-        if _looks_like_pdf_numbered_heading(compact):
-            return 'heading'
-        if _looks_like_pdf_numbered_body_item(compact):
-            return 'body'
-
-        # Enhanced list item recognition
-        if re.match(r'^\s*[（(]?\d+[）)]', text) or re.match(r'^\s*•', text) or re.match(r'^\s*\d+\.\s', text):
-            return 'body'
-
-        if _looks_like_pdf_prose_continuation_fragment(text):
-            return 'body'
-        if _is_likely_pdf_callout_or_annotation(
-            text,
-            line_count=line_count,
-            avg_line_len=avg_line_len,
-            bbox=bbox,
-        ):
-            return 'figure_callout'
-        if '明细表' in compact or compact in {'附注', '注', '注：', '注:'}:
-            return 'table_note'
-        if re.match(r'^第[一二三四五六七八九十百零〇0-9]+[章节]', compact):
-            return 'heading'
-        if re.match(r'^[一二三四五六七八九十]+、', compact):
-            return 'heading'
-
-        # Preservation logic for bold titles in standards
-        if tb.get('is_bold') and len(compact) <= 32 and not re.search(r'[。；;！？!?]', compact):
-            # Exclude things that look like list items or figure callouts
-            if not re.match(r'^\d+\s*$', compact) and not _is_likely_pdf_callout_or_annotation(text, line_count, avg_line_len, bbox):
-                return 'heading'
-
-        cjk_count = len(re.findall(r'[\u4e00-\u9fff]', compact))
-        if cjk_count == 0 and re.search(r'[A-Za-z0-9]', compact):
-            return 'artifact'
-        if re.search(r'^[A-Za-z0-9./\\_+=:;,%()\[\]×x-]+$', compact) and cjk_count < 2:
-            return 'artifact'
-    except Exception:
-        return 'body'
-    return 'body'
-
-
-def _looks_like_pdf_numbered_heading(compact: str) -> bool:
-    value = re.sub(r'\s+', '', str(compact or ''))
-    if not value or len(value) > 24:
-        return False
-    if re.search(r'[。；;！？!?：:]|如图|如表', value):
-        return False
-    # Chapter/section headings in standards often appear as "5变、配电所" or "5.1一般规定".
-    if re.match(r'^\d{1,2}(?:\.\d{1,2})?[\u4e00-\u9fff]', value):
-        return True
-    return False
-
-
-def _looks_like_pdf_numbered_body_item(compact: str) -> bool:
-    value = re.sub(r'\s+', '', str(compact or ''))
-    if not value:
-        return False
-    if _looks_like_pdf_numbered_heading(value):
-        return False
-    # Standards commonly omit the space after list numbers: "1变、配电所..." / "2用于...".
-    return bool(re.match(r'^\d{1,2}[\u4e00-\u9fff]', value))
-
-
-def _looks_like_pdf_attached_numbered_body_item(text: str) -> bool:
-    value = str(text or '').strip()
-    return bool(re.match(r'^\d{1,2}[\u4e00-\u9fff]', value))
-
-
-def _looks_like_pdf_prose_continuation_fragment(text: str) -> bool:
-    raw = str(text or '').strip()
-    compact = re.sub(r'\s+', '', raw)
-    if not compact or len(compact) > 36:
-        return False
-    if _is_pdf_page_marker_text(raw):
-        return False
-    if re.match(r'^(图|表)\s*[0-9一二三四五六七八九十零〇\-—_.．]+', compact, flags=re.IGNORECASE):
-        return False
-    if _FIGURE_DIAGRAM_LEGEND_ONLY_RE.match(compact) or _CABLE_DIAGRAM_LEGEND_ONLY_RE.match(compact):
-        return False
-    cjk_count = len(re.findall(r'[\u4e00-\u9fff]', compact))
-    symbol_count = len(re.findall(r'[A-Za-z0-9()（）/\\_+=:;,%~〜×xX.-]', compact))
-    return cjk_count >= 6 and symbol_count == 0
-
-
-def _is_likely_pdf_callout_or_annotation(
-    text: str,
-    *,
-    line_count: int = 0,
-    avg_line_len: float = 0.0,
-    bbox: Optional[Tuple[int, int, int, int]] = None,
-) -> bool:
-    raw = str(text or '').strip()
-    compact = re.sub(r'\s+', '', raw)
-    if not compact:
-        return False
-    if _is_pdf_page_marker_text(raw):
-        return True
-    if len(compact) > 24:
-        return False
-    if re.match(r'^(图|表)\s*[0-9一二三四五六七八九十零〇\-—_.．]+', compact, flags=re.IGNORECASE):
-        return False
-    if re.match(r'^第[一二三四五六七八九十百零〇0-9]+[章节]', compact):
-        return False
-    if re.match(r'^(?:第?[一二三四五六七八九十百零〇0-9]*)?条[）)]?$', compact):
-        return False
-    if re.search(r'第[一二三四五六七八九十百零〇0-9]+条[）)]?$', compact):
-        return False
-    if re.match(r'^[一二三四五六七八九十]+、', compact):
-        return False
-    if _FIGURE_DIAGRAM_LEGEND_ONLY_RE.match(compact) or _CABLE_DIAGRAM_LEGEND_ONLY_RE.match(compact):
-        return True
-    if any(ch in compact for ch in '。；;！？!?：:'):
-        return False
-    cjk_count = len(re.findall(r'[\u4e00-\u9fff]', compact))
-    if cjk_count >= 4 and re.search(r'[》）)]$', compact):
-        return False
-    if re.fullmatch(r'[（(]?[A-Za-z0-9一二三四五六七八九十]+[)）]?', compact):
-        return True
-    if re.search(r'\d+(?:mm|MM|cm|CM|kv|kV|V|A|m)', compact):
-        return True
-    if any(token in compact for token in ('中心线', '尺寸', '推荐', '最小布置', '侧视图', '平面图', '屏前通道')):
-        return True
-    if re.search(r'(?:×|x|X|~|〜|－|-)', compact) and len(compact) <= 18:
-        return True
-    symbol_count = len(re.findall(r'[A-Za-z0-9()（）/\\_+=:;,%~〜×xX.-]', compact))
-    width = int(bbox[2]) if isinstance(bbox, (tuple, list)) and len(bbox) >= 3 else 0
-    if line_count <= 2 and avg_line_len <= 10.0 and cjk_count <= 10 and symbol_count >= 1:
-        return True
-    if width and width <= 240 and len(compact) <= 14 and cjk_count <= 10:
-        return True
-    return False
 
 
 def _make_text_structure_block(tb: Dict, *, page_number: int, order_index: int, page_render_w: int = 0) -> Optional[Dict]:
@@ -1677,7 +1194,7 @@ def _make_text_structure_block(tb: Dict, *, page_number: int, order_index: int, 
         if not text or int(w) <= 0 or int(h) <= 0:
             return None
 
-        semantic_role = _infer_text_structure_semantic_role(tb)
+        semantic_role = infer_text_structure_semantic_role(tb)
 
         # Map semantic role to a dedicated block type instead of generic 'code'
         block_type = 'paragraph'
@@ -1696,9 +1213,7 @@ def _make_text_structure_block(tb: Dict, *, page_number: int, order_index: int, 
                 if abs(block_center_x - page_center_x) < (page_render_w * 0.05):
                     alignment = 'center'
 
-        bbox_norm = _xywh_to_bbox_dict(int(x), int(y), int(w), int(h))
-        bbox_str = f"{bbox_norm['left']},{bbox_norm['top']},{bbox_norm['right']},{bbox_norm['bottom']}"
-        block_id = hashlib.sha1(f"pdftext|{page_number}|{text[:256]}|{bbox_str}".encode('utf-8')).hexdigest()[:12]
+        block_id = hashlib.sha1(f"pdftext|{page_number}|{order_index}|{text[:200]}".encode('utf-8')).hexdigest()[:12]
         return {
             'id': f'b_text_{block_id}',
             'type': block_type,
@@ -1707,8 +1222,7 @@ def _make_text_structure_block(tb: Dict, *, page_number: int, order_index: int, 
             'text': text if block_type != 'code' else None,
             'pageNumber': int(page_number),
             'semanticRole': semantic_role,
-            'bbox': bbox_norm,
-            'spans': tb.get('spans'),
+            'bbox': _xywh_to_bbox_dict(int(x), int(y), int(w), int(h)),
             'readingOrder': int(order_index),
             'structureSource': 'pdf_native_text_box',
             'confidence': 1.0,
@@ -1773,1349 +1287,9 @@ def _assign_page_structure_order(blocks: List[Dict], *, page_number: int) -> Lis
     return result
 
 
-def _estimate_text_span_ratio(tb: Dict, crop_w: int) -> float:
-    try:
-        if crop_w <= 0:
-            return 1.0
-        _bx, _by, bw, bh = tb.get('bbox', (0, 0, 0, 0))
-        line_count = max(1, int(tb.get('line_count') or 0))
-        avg_line_len = float(tb.get('avg_line_len') or 0.0)
-        bbox_ratio = float(bw) / float(max(1, crop_w))
-        if avg_line_len <= 0.0 or bh <= 0:
-            return bbox_ratio
-        approx_char_px = max(6.0, min(32.0, (float(bh) / float(line_count)) * 0.92))
-        est_span_px = float(avg_line_len) * approx_char_px
-        est_ratio = est_span_px / float(max(1, crop_w))
-        return max(bbox_ratio, est_ratio)
-    except Exception:
-        return 1.0
 
 
-def _normalize_figure_note_text(text: str) -> str:
-    try:
-        compact = re.sub(r'\s+', '', str(text or ''))
-        return compact.strip()
-    except Exception:
-        return ''
 
-
-def _looks_like_figure_note_text(text: str) -> bool:
-    try:
-        compact = _normalize_figure_note_text(text)
-        if not compact:
-            return False
-        if re.match(r'^(图|表|Fig\.?|Figure|Table|注|说明)\s*', compact, flags=re.IGNORECASE):
-            return True
-        if re.match(r'^[（(]?[a-zA-Z0-9一二三四五六七八九十]+[）)](?:[-—:：.]|$)', compact):
-            return True
-        if re.match(r'^(?:[0-9]{1,2}|[a-zA-Z])[\-—:：][^。；;！？!?]{1,24}$', compact):
-            return True
-        if re.search(r'(?:^|[，,；;、])(?:[0-9]{1,2}|[a-zA-Z]|[（(][a-zA-Z0-9一二三四五六七八九十]+[）)])\s*[\-—:：]\s*[^。；;！？!?]{1,18}', compact):
-            return True
-        if len(compact) <= 36 and re.search(r'[（(][a-zA-Z0-9一二三四五六七八九十]+[）)]', compact):
-            return True
-    except Exception:
-        return False
-    return False
-
-
-def _is_caption_like_text_block(tb: Dict, crop_w: int) -> bool:
-    try:
-        _bx, _by, bw, _bh = tb.get('bbox', (0, 0, 0, 0))
-        line_count = int(tb.get('line_count') or 0)
-        avg_line_len = float(tb.get('avg_line_len') or 0.0)
-        text = str(tb.get('text') or '').strip()
-        width_ratio = (float(bw) / float(max(1, crop_w))) if crop_w > 0 else 1.0
-        span_ratio = _estimate_text_span_ratio(tb, crop_w)
-        if re.match(r'^(图|表|Fig\.?|Figure|Table|注)\s*', text, flags=re.IGNORECASE):
-            return True
-        if _looks_like_figure_note_text(text) and line_count <= 2 and span_ratio <= 0.96:
-            return True
-        if line_count <= 2 and avg_line_len <= 14.0 and width_ratio <= 0.78:
-            return True
-        if line_count <= 1 and width_ratio <= 0.88:
-            return True
-        if line_count <= 3 and avg_line_len <= 22.0 and span_ratio <= 0.86:
-            if len(text) <= max(54, int(float(max(1, crop_w)) / 18.0)):
-                if not re.search(r'[。；;！？!?].+[。；;！？!?]', text):
-                    return True
-    except Exception:
-        return False
-    return False
-
-
-def _is_compact_annotation_like_text_block(tb: Dict, crop_w: int) -> bool:
-    try:
-        _bx, _by, bw, _bh = tb.get('bbox', (0, 0, 0, 0))
-        line_count = int(tb.get('line_count') or 0)
-        avg_line_len = float(tb.get('avg_line_len') or 0.0)
-        text = str(tb.get('text') or '').strip()
-        if not text:
-            return False
-        width_ratio = (float(bw) / float(max(1, crop_w))) if crop_w > 0 else 1.0
-        span_ratio = _estimate_text_span_ratio(tb, crop_w)
-        if _is_caption_like_text_block(tb, crop_w):
-            return True
-        if _looks_like_figure_note_text(text) and line_count <= 4 and span_ratio <= 0.98 and len(_normalize_figure_note_text(text)) <= 52:
-            return True
-        if line_count <= 3 and avg_line_len <= 18.0 and width_ratio <= 0.92 and span_ratio <= 0.94 and len(text) <= 42:
-            if not re.search(r'[。；;！？!?]', text):
-                return True
-        if line_count <= 2 and width_ratio <= 0.72 and span_ratio <= 0.78 and len(text) <= 24:
-            return True
-    except Exception:
-        return False
-    return False
-
-
-def _pad_visual_bbox(
-    bbox: Tuple[int, int, int, int],
-    kind: str,
-    page_w: int,
-    page_h: int,
-) -> Tuple[int, int, int, int]:
-    try:
-        x, y, w, h = bbox
-        if page_w <= 0 or page_h <= 0 or w <= 0 or h <= 0:
-            return bbox
-        pad_x = max(VISUAL_BBOX_PAD_PX, int(float(w) * 0.012))
-        pad_y = max(VISUAL_BBOX_PAD_PX, int(float(h) * 0.015))
-        pad_top = pad_y
-        pad_bottom = pad_y
-        if kind == 'table':
-            pad_x = max(pad_x, 10)
-            pad_top = max(pad_y, 10)
-            pad_bottom = max(pad_y, 10)
-        elif kind in ('figure', 'equation'):
-            pad_top = max(pad_y, 10)
-            pad_bottom = max(pad_y, int(float(h) * 0.045), 18)
-            if kind == 'figure' and int(h) <= 420:
-                # Short subfigure crops are prone to losing tiny bottom labels.
-                pad_bottom = max(pad_bottom, int(float(h) * 0.12), 36)
-        return _clip_xywh_to_page(int(x) - pad_x, int(y) - pad_top, int(w) + (pad_x * 2), int(h) + pad_top + pad_bottom, page_w, page_h)
-    except Exception:
-        return bbox
-
-
-def _clamp_visual_bbox_growth(
-    anchor_bbox: Tuple[int, int, int, int],
-    candidate_bbox: Tuple[int, int, int, int],
-    kind: str,
-    page_w: int,
-    page_h: int,
-) -> Tuple[int, int, int, int]:
-    try:
-        ax, ay, aw, ah = anchor_bbox
-        cx, cy, cw, ch = candidate_bbox
-        if kind not in ('figure', 'equation', 'table'):
-            return _clip_xywh_to_page(cx, cy, cw, ch, page_w, page_h)
-
-        grow_left = max(24, int(float(aw) * 0.08))
-        grow_right = max(24, int(float(aw) * 0.08))
-        grow_top = max(24, int(float(ah) * 0.08))
-        grow_bottom = max(70, int(float(ah) * 0.24))
-        if kind in ('figure', 'equation'):
-            grow_left = max(14, int(float(aw) * 0.03))
-            grow_right = max(14, int(float(aw) * 0.03))
-            grow_top = max(14, int(float(ah) * 0.03))
-            grow_bottom = max(110, int(float(ah) * 0.42))
-        elif kind == 'table':
-            grow_left = max(grow_left, 36)
-            grow_right = max(grow_right, 36)
-            grow_top = max(grow_top, 30)
-            grow_bottom = max(grow_bottom, 90)
-
-        min_x = ax - grow_left
-        max_x1 = ax + aw + grow_right
-        min_y = ay - grow_top
-        max_y1 = ay + ah + grow_bottom
-
-        nx0 = max(min_x, cx)
-        ny0 = max(min_y, cy)
-        nx1 = min(max_x1, cx + cw)
-        ny1 = min(max_y1, cy + ch)
-        if nx1 <= nx0 or ny1 <= ny0:
-            return _clip_xywh_to_page(cx, cy, cw, ch, page_w, page_h)
-        return _clip_xywh_to_page(nx0, ny0, nx1 - nx0, ny1 - ny0, page_w, page_h)
-    except Exception:
-        return candidate_bbox
-
-
-def _build_visual_signal_mask(block_bgr) -> Optional["np.ndarray"]:
-    if block_bgr is None or not (_HAS_NUMPY and _HAS_CV2):
-        return None
-    try:
-        gray = cv2.cvtColor(block_bgr, cv2.COLOR_BGR2GRAY)
-        inv = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            31,
-            9,
-        )
-        edges = cv2.Canny(gray, 40, 140)
-        mask = cv2.bitwise_or(inv, edges)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
-        return mask
-    except Exception:
-        return None
-
-
-def _refine_visual_bbox_from_pixels(
-    page_cv,
-    bbox: Tuple[int, int, int, int],
-    kind: str,
-) -> List[Tuple[int, int, int, int]]:
-    """Expand or shrink visual boxes using connected foreground components.
-
-    This is document-agnostic: it does not assume any fixed image height and only
-    relies on nearby visual strokes/components.
-    """
-    if page_cv is None or not (_HAS_NUMPY and _HAS_CV2):
-        return [bbox]
-    try:
-        page_h, page_w = page_cv.shape[:2]
-        x, y, w, h = _clip_xywh_to_page(*bbox, page_w, page_h)
-        pad_x = max(12, int(w * 0.10))
-        pad_y = max(12, int(h * 0.10))
-        if kind in ('figure', 'equation'):
-            # Give small lower annotations (for example (a)/(b), 1-名称) a chance
-            # to enter the CC candidate ROI before text-aware trimming runs.
-            pad_y = max(pad_y, int(h * 0.15), 18)
-        sx = max(0, x - pad_x)
-        sy = max(0, y - pad_y)
-        ex = min(page_w, x + w + pad_x)
-        ey = min(page_h, y + h + pad_y)
-        roi = page_cv[sy:ey, sx:ex]
-        if roi is None or getattr(roi, 'size', 0) == 0:
-            return [bbox]
-
-        mask = _build_visual_signal_mask(roi)
-        if mask is None:
-            return [bbox]
-
-        num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        seed_box = (x - sx, y - sy, w, h)
-        seed_x0, seed_y0, seed_w, seed_h = seed_box
-        seed_x1 = seed_x0 + seed_w
-        seed_y1 = seed_y0 + seed_h
-        roi_area = float((ex - sx) * (ey - sy))
-        min_cc_area = max(20, int(roi_area * 0.00008))
-        selected: List[Tuple[int, int, int, int]] = []
-
-        for label in range(1, int(num_labels)):
-            x0 = int(stats[label, cv2.CC_STAT_LEFT])
-            y0 = int(stats[label, cv2.CC_STAT_TOP])
-            ww = int(stats[label, cv2.CC_STAT_WIDTH])
-            hh = int(stats[label, cv2.CC_STAT_HEIGHT])
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            if area < min_cc_area or ww <= 0 or hh <= 0:
-                continue
-            x1 = x0 + ww
-            y1 = y0 + hh
-            overlap = _bbox_overlap_1d(x0, x1, seed_x0, seed_x1) * _bbox_overlap_1d(y0, y1, seed_y0, seed_y1)
-            near_x = max(0, max(seed_x0 - x1, x0 - seed_x1))
-            near_y = max(0, max(seed_y0 - y1, y0 - seed_y1))
-            near_x_thr = max(10, int(seed_w * 0.08))
-            near_y_thr = max(10, int(seed_h * 0.08))
-            if kind in ('figure', 'equation'):
-                near_y_thr = max(near_y_thr, int(seed_h * 0.16), 16)
-            if overlap > 0 or (near_x <= near_x_thr and near_y <= near_y_thr):
-                selected.append((x0, y0, ww, hh))
-
-        if not selected:
-            return [bbox]
-
-        changed = True
-        gap_x_thr = max(12, int(seed_w * 0.10))
-        gap_y_thr = max(12, int(seed_h * 0.10))
-        if kind in ('figure', 'equation'):
-            gap_y_thr = max(gap_y_thr, int(seed_h * 0.16), 18)
-        while changed:
-            changed = False
-            ux0 = min(c[0] for c in selected)
-            uy0 = min(c[1] for c in selected)
-            ux1 = max(c[0] + c[2] for c in selected)
-            uy1 = max(c[1] + c[3] for c in selected)
-            for label in range(1, int(num_labels)):
-                x0 = int(stats[label, cv2.CC_STAT_LEFT])
-                y0 = int(stats[label, cv2.CC_STAT_TOP])
-                ww = int(stats[label, cv2.CC_STAT_WIDTH])
-                hh = int(stats[label, cv2.CC_STAT_HEIGHT])
-                area = int(stats[label, cv2.CC_STAT_AREA])
-                cand = (x0, y0, ww, hh)
-                if area < min_cc_area or cand in selected:
-                    continue
-                x1 = x0 + ww
-                y1 = y0 + hh
-                gap_x = max(0, max(ux0 - x1, x0 - ux1))
-                gap_y = max(0, max(uy0 - y1, y0 - uy1))
-                y_overlap = _bbox_overlap_1d(y0, y1, uy0, uy1)
-                x_overlap = _bbox_overlap_1d(x0, x1, ux0, ux1)
-                if (gap_x <= gap_x_thr and y_overlap >= max(8, int(min(hh, uy1 - uy0) * 0.15))) or (gap_y <= gap_y_thr and x_overlap >= max(8, int(min(ww, ux1 - ux0) * 0.15))):
-                    selected.append(cand)
-                    changed = True
-
-        if kind in ('figure', 'equation') and selected:
-            try:
-                ux0 = min(c[0] for c in selected)
-                uy1 = max(c[1] + c[3] for c in selected)
-                uwidth = max(1, max(c[0] + c[2] for c in selected) - ux0)
-                cap_gap_max = max(90, int(seed_h * 0.34))
-                cap_h_max = max(54, int(seed_h * 0.16))
-                cap_w_min = max(56, int(seed_w * 0.22))
-                cap_w_max = max(cap_w_min + 1, int(seed_w * 0.96))
-                cap_fill_min = 0.035
-                cap_candidates: List[Tuple[int, int, int, int]] = []
-
-                for label in range(1, int(num_labels)):
-                    x0 = int(stats[label, cv2.CC_STAT_LEFT])
-                    y0 = int(stats[label, cv2.CC_STAT_TOP])
-                    ww = int(stats[label, cv2.CC_STAT_WIDTH])
-                    hh = int(stats[label, cv2.CC_STAT_HEIGHT])
-                    area = int(stats[label, cv2.CC_STAT_AREA])
-                    cand = (x0, y0, ww, hh)
-                    if cand in selected:
-                        continue
-                    if ww <= 0 or hh <= 0:
-                        continue
-                    if hh > cap_h_max:
-                        continue
-                    if ww < cap_w_min or ww > cap_w_max:
-                        continue
-                    if y0 < uy1:
-                        continue
-                    gap = y0 - uy1
-                    if gap > cap_gap_max:
-                        continue
-                    x_ov = _bbox_overlap_1d(x0, x0 + ww, ux0, ux0 + uwidth)
-                    if x_ov < max(24, int(min(ww, uwidth) * 0.22)):
-                        continue
-                    fill = float(area) / float(max(1, ww * hh))
-                    if fill < cap_fill_min:
-                        continue
-                    cap_candidates.append(cand)
-
-                if cap_candidates:
-                    cap_candidates = sorted(cap_candidates, key=lambda b: (b[1], b[0]))
-                    band_bottom = uy1
-                    band_gap = max(20, int(seed_h * 0.07))
-                    for cand in cap_candidates:
-                        cy = cand[1]
-                        if cy > band_bottom + band_gap:
-                            break
-                        selected.append(cand)
-                        band_bottom = max(band_bottom, cand[1] + cand[3])
-            except Exception:
-                pass
-
-        rx0 = min(c[0] for c in selected)
-        ry0 = min(c[1] for c in selected)
-        rx1 = max(c[0] + c[2] for c in selected)
-        ry1 = max(c[1] + c[3] for c in selected)
-        refined = _clip_xywh_to_page(sx + rx0, sy + ry0, rx1 - rx0, ry1 - ry0, page_w, page_h)
-
-        # Guard against aggressive shrink: connected components may miss faint
-        # strokes near figure edges, which can create partial crops.
-        if kind in ('figure', 'equation'):
-            try:
-                ox, oy, ow, oh = x, y, w, h
-                rx, ry, rw, rh = refined
-                min_w = max(1, int(float(ow) * 0.90))
-                min_h = max(1, int(float(oh) * 0.90))
-                if rw < min_w:
-                    rx, rw = ox, ow
-                if rh < min_h:
-                    ry, rh = oy, oh
-                refined = _clip_xywh_to_page(rx, ry, rw, rh, page_w, page_h)
-            except Exception:
-                pass
-
-        if kind == 'figure':
-            if _should_split_figure_bbox(page_cv, refined):
-                return _decompose_compound_visual_bbox(page_cv, refined, kind)
-            try:
-                if refined[2] >= 260 and refined[3] >= 220:
-                    stacked = _split_stacked_figure_bbox(page_cv, refined[0], refined[1], refined[2], refined[3])
-                    if len(stacked) > 1:
-                        return stacked
-            except Exception:
-                pass
-            return [refined]
-        return [refined]
-    except Exception:
-        return [bbox]
-
-
-def _trim_visual_bbox_with_text_boxes(
-    bbox: Tuple[int, int, int, int],
-    text_boxes: List[Dict],
-    kind: str,
-    page_h: int,
-) -> Tuple[int, int, int, int]:
-    """Trim paragraph text from visual crops using native PDF text block geometry."""
-    x, y, w, h = bbox
-    x1 = x + w
-    y1 = y + h
-    if kind not in ('figure', 'equation') or not text_boxes:
-        return bbox
-
-    overlap_boxes: List[Dict] = []
-    for tb in text_boxes:
-        try:
-            tx, ty, tw, th = tb.get('bbox', (0, 0, 0, 0))
-            tx1 = tx + tw
-            ty1 = ty + th
-            x_ov = _bbox_overlap_1d(x, x1, tx, tx1)
-            if x_ov <= 0:
-                continue
-            x_ratio = float(x_ov) / float(max(1, min(w, tw)))
-            if x_ratio < 0.35:
-                is_note_like = _is_compact_annotation_like_text_block(tb, w)
-                tb_center = float(tx + tx1) * 0.5
-                box_center = float(x + x1) * 0.5
-                center_delta = abs(tb_center - box_center)
-                center_limit = max(float(tw) * 0.9, float(w) * 0.28)
-                if not (is_note_like and x_ov >= max(18, int(min(w, tw) * 0.15)) and center_delta <= center_limit):
-                    continue
-            overlap_boxes.append(tb)
-        except Exception:
-            continue
-
-    if not overlap_boxes:
-        return bbox
-
-    below = sorted((tb for tb in overlap_boxes if tb['bbox'][1] >= y + int(h * 0.25)), key=lambda tb: tb['bbox'][1])
-    kept_bottom = y1
-    seen_note_band = False
-    note_band_bottom = -1
-    caption_tail_gap = max(TEXT_TRIM_MARGIN_PX * 3, int(h * 0.08))
-    caption_tail_limit = max(170, int(h * 0.46))
-    for tb in below:
-        tx, ty, tw, th = tb['bbox']
-        if ty >= kept_bottom:
-            continue
-        is_note_like = _is_compact_annotation_like_text_block(tb, w)
-        if is_note_like and not seen_note_band:
-            note_band_bottom = ty + th
-            kept_bottom = min(page_h, note_band_bottom + max(TEXT_TRIM_MARGIN_PX, int(h * 0.015)))
-            seen_note_band = True
-            continue
-        if seen_note_band and is_note_like:
-            if ty <= (note_band_bottom + caption_tail_gap) and (ty + th) <= (y1 + caption_tail_limit):
-                note_band_bottom = max(note_band_bottom, ty + th)
-                kept_bottom = min(page_h, note_band_bottom + max(TEXT_TRIM_MARGIN_PX, int(h * 0.015)))
-                continue
-        if ty > y + int(h * 0.18):
-            kept_bottom = min(kept_bottom, max(y + max(80, int(h * 0.30)), ty - TEXT_TRIM_MARGIN_PX))
-            break
-
-    above = sorted((tb for tb in overlap_boxes if (tb['bbox'][1] + tb['bbox'][3]) <= y + int(h * 0.65)), key=lambda tb: tb['bbox'][1] + tb['bbox'][3], reverse=True)
-    kept_top = y
-    for tb in above:
-        tx, ty, tw, th = tb['bbox']
-        if _is_caption_like_text_block(tb, w):
-            continue
-        if (ty + th) < y1 and (ty + th) >= y:
-            kept_top = max(kept_top, ty + th + TEXT_TRIM_MARGIN_PX)
-            break
-
-    kept_left = x
-    kept_right = x1
-    side_boxes = sorted(overlap_boxes, key=lambda tb: (tb['bbox'][0], tb['bbox'][1]))
-    for tb in side_boxes:
-        tx, ty, tw, th = tb['bbox']
-        if _is_compact_annotation_like_text_block(tb, w):
-            continue
-        y_ov = _bbox_overlap_1d(y, y1, ty, ty + th)
-        if y_ov <= 0:
-            continue
-        y_ratio = float(y_ov) / float(max(1, min(h, th)))
-        if y_ratio < 0.25:
-            continue
-        tb_right = tx + tw
-        if tx <= x + int(w * 0.10) and tb_right <= x + int(w * 0.42):
-            kept_left = max(kept_left, tb_right + TEXT_TRIM_MARGIN_PX)
-            continue
-        if tb_right >= x1 - int(w * 0.10) and tx >= x + int(w * 0.58):
-            kept_right = min(kept_right, tx - TEXT_TRIM_MARGIN_PX)
-
-    new_y = min(kept_top, kept_bottom - 1)
-    new_x = min(kept_left, kept_right - 1)
-    new_h = max(1, kept_bottom - new_y)
-    new_w = max(1, kept_right - new_x)
-    if new_h < max(80, int(h * 0.45)):
-        return bbox
-    if new_w < max(140, int(w * 0.52)):
-        new_x = x
-        new_w = w
-    return (new_x, new_y, new_w, new_h)
-
-
-def _infer_figure_split_axis(split_boxes: List[Tuple[int, int, int, int]]) -> str:
-    if len(split_boxes) < 2:
-        return ''
-    try:
-        boxes = sorted(split_boxes, key=lambda b: (b[1], b[0]))
-        if len(boxes) == 2:
-            a = boxes[0]
-            b = boxes[1]
-            acx = float(a[0]) + (float(a[2]) * 0.5)
-            bcx = float(b[0]) + (float(b[2]) * 0.5)
-            acy = float(a[1]) + (float(a[3]) * 0.5)
-            bcy = float(b[1]) + (float(b[3]) * 0.5)
-            return 'cols' if abs(acx - bcx) >= abs(acy - bcy) else 'rows'
-        x_centers = [float(b[0]) + (float(b[2]) * 0.5) for b in boxes]
-        y_centers = [float(b[1]) + (float(b[3]) * 0.5) for b in boxes]
-        x_span = max(x_centers) - min(x_centers)
-        y_span = max(y_centers) - min(y_centers)
-        return 'cols' if x_span >= y_span else 'rows'
-    except Exception:
-        return 'cols'
-
-
-def _caption_supports_figure_split(
-    parent_bbox: Tuple[int, int, int, int],
-    split_boxes: List[Tuple[int, int, int, int]],
-    page_text_boxes: List[Dict],
-    layout_support_boxes: Optional[List[Dict]] = None,
-) -> bool:
-    if len(split_boxes) <= 1:
-        return True
-    if not page_text_boxes and not layout_support_boxes:
-        return False
-
-    try:
-        px, py, pw, ph = parent_bbox
-        axis = _infer_figure_split_axis(split_boxes)
-        relevant = _collect_relevant_figure_support_regions(parent_bbox, page_text_boxes, layout_support_boxes)
-
-        if not relevant:
-            return False
-
-        child_hits = [0 for _ in split_boxes]
-        for tx, ty, tw, th in relevant:
-            best_idx = -1
-            best_score = 0.0
-            t_center_y = float(ty) + (float(th) * 0.5)
-            for idx, (sx, sy, sw, sh) in enumerate(split_boxes):
-                sx1 = sx + sw
-                x_overlap = _bbox_overlap_1d(sx, sx1, tx, tx + tw)
-                if x_overlap <= 0:
-                    continue
-                x_score = float(x_overlap) / float(max(1, min(sw, tw)))
-                if axis == 'rows':
-                    child_bottom = float(sy + sh)
-                    max_dy = max(40.0, float(ph) * 0.22)
-                    dy = abs(t_center_y - child_bottom)
-                    if dy > max_dy:
-                        continue
-                    score = x_score - (dy / max_dy) * 0.15
-                else:
-                    score = x_score
-                if score > best_score:
-                    best_score = score
-                    best_idx = idx
-            if best_idx >= 0 and best_score >= 0.35:
-                child_hits[best_idx] += 1
-
-        return all(hit > 0 for hit in child_hits)
-    except Exception:
-        return False
-
-
-def _reconcile_figure_split_boxes(
-    parent_bbox: Tuple[int, int, int, int],
-    split_boxes: List[Tuple[int, int, int, int]],
-    page_text_boxes: List[Dict],
-    layout_support_boxes: Optional[List[Dict]] = None,
-    page_cv=None,
-) -> List[Tuple[int, int, int, int]]:
-    if len(split_boxes) <= 1:
-        return split_boxes
-    try:
-        split_boxes = _suppress_nested_figure_boxes(split_boxes)
-        if len(split_boxes) <= 1:
-            return split_boxes
-        px, py, pw, ph = parent_bbox
-        merged_parent = parent_bbox
-        try:
-            mx0 = int(px)
-            my0 = int(py)
-            mx1 = int(px + pw)
-            my1 = int(py + ph)
-            for sx, sy, sw, sh in split_boxes:
-                mx0 = min(mx0, int(sx))
-                my0 = min(my0, int(sy))
-                mx1 = max(mx1, int(sx + sw))
-                my1 = max(my1, int(sy + sh))
-            merged_parent = (mx0, my0, max(1, mx1 - mx0), max(1, my1 - my0))
-        except Exception:
-            merged_parent = parent_bbox
-        if page_cv is not None:
-            for child in split_boxes:
-                if not _figure_box_looks_self_contained(page_cv, child):
-                    return [parent_bbox]
-        if _caption_supports_figure_split(parent_bbox, split_boxes, page_text_boxes, layout_support_boxes):
-            return split_boxes
-        try:
-            parent_bottom = py + ph
-            merged_bottom = merged_parent[1] + merged_parent[3]
-            if merged_bottom > parent_bottom + max(18, int(ph * 0.05)):
-                return [merged_parent]
-        except Exception:
-            pass
-        return [parent_bbox]
-    except Exception:
-        return [parent_bbox]
-
-
-def _trim_visual_bbox_with_image_rows(
-    page_cv,
-    bbox: Tuple[int, int, int, int],
-    kind: str,
-) -> Tuple[int, int, int, int]:
-    """Fallback trim for scanned PDFs without reliable native text boxes.
-
-    Detects dense text-row clusters near the lower part of a visual crop and
-    trims trailing paragraph-like regions while keeping figure content.
-    """
-    if page_cv is None or not (_HAS_NUMPY and _HAS_CV2):
-        return bbox
-    if kind not in ('figure', 'equation'):
-        return bbox
-
-    try:
-        ph, pw = page_cv.shape[:2]
-        x, y, w, h = _clip_xywh_to_page(*bbox, pw, ph)
-        if w < 220 or h < 170:
-            return (x, y, w, h)
-
-        roi = page_cv[y:y + h, x:x + w]
-        if roi is None or getattr(roi, 'size', 0) == 0:
-            return (x, y, w, h)
-
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        inv = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            31,
-            9,
-        )
-
-        # Merge nearby glyph strokes into text-line candidates.
-        k_w = max(26, int(w * 0.085))
-        text_lines = cv2.morphologyEx(
-            inv,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, 3)),
-            iterations=1,
-        )
-        text_lines = cv2.morphologyEx(
-            text_lines,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2)),
-            iterations=1,
-        )
-
-        contours, _hier = cv2.findContours(text_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        line_boxes: List[Tuple[int, int, int, int]] = []
-        for cnt in contours:
-            lx, ly, lw, lh = cv2.boundingRect(cnt)
-            if lw < max(44, int(w * 0.22)):
-                continue
-            if lh > max(34, int(h * 0.10)):
-                continue
-            if ly < int(h * 0.16):
-                continue
-            try:
-                patch = text_lines[ly:ly + lh, lx:lx + lw]
-                if patch is None or patch.size == 0:
-                    continue
-                fill = float(cv2.countNonZero(patch)) / float(max(1, lw * lh))
-            except Exception:
-                fill = 0.0
-            if fill < 0.06:
-                continue
-            line_boxes.append((lx, ly, lw, lh))
-
-        if len(line_boxes) < 3:
-            return (x, y, w, h)
-
-        line_boxes = sorted(line_boxes, key=lambda t: t[1])
-        gap_thr = max(12, int(h * 0.035))
-        clusters: List[List[Tuple[int, int, int, int]]] = []
-        cur_cluster: List[Tuple[int, int, int, int]] = [line_boxes[0]]
-        for cur in line_boxes[1:]:
-            prev = cur_cluster[-1]
-            prev_bottom = prev[1] + prev[3]
-            if (cur[1] - prev_bottom) <= gap_thr:
-                cur_cluster.append(cur)
-            else:
-                clusters.append(cur_cluster)
-                cur_cluster = [cur]
-        clusters.append(cur_cluster)
-
-        def _cluster_metrics(cluster: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int, float]:
-            cy0 = min(c[1] for c in cluster)
-            cy1 = max(c[1] + c[3] for c in cluster)
-            width_cov = float(sum(c[2] for c in cluster)) / float(max(1, len(cluster) * w))
-            return cy0, cy1, len(cluster), width_cov
-
-        edge_gap_thr = max(18, int(h * 0.05))
-
-        if clusters:
-            top_cluster = clusters[0]
-            top_y0, top_y1, top_count, top_width_cov = _cluster_metrics(top_cluster)
-            next_gap = 0
-            if len(clusters) >= 2:
-                next_y0 = min(c[1] for c in clusters[1])
-                next_gap = max(0, next_y0 - top_y1)
-            if top_y1 <= int(h * 0.18) and next_gap >= edge_gap_thr and top_width_cov >= 0.56:
-                new_y = y + min(h - 1, top_y1 + TEXT_TRIM_MARGIN_PX)
-                new_h = max(1, (y + h) - new_y)
-                if new_h >= max(110, int(h * 0.68)):
-                    return (x, new_y, w, new_h)
-
-            bottom_cluster = clusters[-1]
-            bot_y0, bot_y1, bot_count, bot_width_cov = _cluster_metrics(bottom_cluster)
-            prev_gap = 0
-            if len(clusters) >= 2:
-                prev_y1 = max(c[1] + c[3] for c in clusters[-2])
-                prev_gap = max(0, bot_y0 - prev_y1)
-
-            is_footer_like = bot_y0 >= int(h * 0.88) and bot_width_cov <= 0.18
-            is_paragraph_like = bot_y0 >= int(h * 0.72) and bot_width_cov >= 0.58 and prev_gap >= edge_gap_thr
-            if is_footer_like or is_paragraph_like:
-                cut_local_y = max(int(h * 0.35), min(bot_y0 - TEXT_TRIM_MARGIN_PX, h - 1))
-                new_h = max(1, cut_local_y)
-                if new_h >= max(110, int(h * 0.62)):
-                    return (x, y, w, new_h)
-
-        text_cluster = None
-        for cluster in reversed(clusters):
-            cy0 = min(c[1] for c in cluster)
-            cy1 = max(c[1] + c[3] for c in cluster)
-            if cy0 < int(h * 0.50):
-                continue
-            ccount = len(cluster)
-            width_cov = float(sum(c[2] for c in cluster)) / float(max(1, len(cluster) * w))
-            cspan = cy1 - cy0
-            if (ccount >= 3 and width_cov >= 0.28) or (ccount >= 2 and width_cov >= 0.36 and cspan >= int(h * 0.12)):
-                text_cluster = cluster
-                break
-
-        if not text_cluster:
-            return (x, y, w, h)
-
-        cut_local_y = min(c[1] for c in text_cluster) - TEXT_TRIM_MARGIN_PX
-        cut_local_y = max(int(h * 0.35), min(cut_local_y, h - 1))
-        new_h = cut_local_y
-        if new_h < max(90, int(h * 0.45)):
-            return (x, y, w, h)
-
-        return (x, y, w, new_h)
-    except Exception:
-        return bbox
-
-
-def _shrink_visual_bbox_to_blank_edges(
-    page_cv,
-    bbox: Tuple[int, int, int, int],
-    kind: str,
-    page_text_boxes: Optional[List[Dict]] = None,
-    layout_support_boxes: Optional[List[Dict]] = None,
-    anchor_bbox: Optional[Tuple[int, int, int, int]] = None,
-    semantic_safety_floor: Optional[int] = None,
-    semantic_text_boxes: Optional[List[Dict]] = None,
-    debug_context: str = '',
-) -> Tuple[int, int, int, int]:
-    """Trim stray edge signal from figure crops until a real blank band is reached.
-
-    This is intentionally conservative and only applies to visual crops. It is
-    mainly aimed at split-child figures that still carry thin neighbor strokes on
-    the left/right/top edges, while avoiding caption-band damage on the bottom
-    edge when source/layout support suggests the lower band belongs to the figure.
-    """
-    if page_cv is None or not (_HAS_NUMPY and _HAS_CV2):
-        return bbox
-    if kind not in ('figure', 'equation'):
-        return bbox
-
-    try:
-        ph, pw = page_cv.shape[:2]
-        x, y, w, h = _clip_xywh_to_page(*bbox, pw, ph)
-        if w < 120 or h < 120:
-            return (x, y, w, h)
-
-        roi = page_cv[y:y + h, x:x + w]
-        if roi is None or getattr(roi, 'size', 0) == 0:
-            return (x, y, w, h)
-
-        mask = _build_visual_signal_mask(roi)
-        if mask is None or getattr(mask, 'size', 0) == 0:
-            return (x, y, w, h)
-
-        total_density = float(cv2.countNonZero(mask)) / float(max(1, mask.shape[0] * mask.shape[1]))
-        if total_density <= 0.004:
-            return (x, y, w, h)
-
-        blank_thr = max(0.0025, min(0.016, total_density * 0.42))
-        signal_thr = max(blank_thr * 2.4, min(0.032, total_density * 1.05))
-
-        relevant_support = _collect_relevant_figure_support_regions(
-            anchor_bbox or bbox,
-            page_text_boxes or [],
-            layout_support_boxes,
-        )
-        protect_bottom = False
-        for sx, sy, sw, sh in relevant_support:
-            if _bbox_overlap_1d(x, x + w, sx, sx + sw) < max(18, int(min(w, sw) * 0.18)):
-                continue
-            if (sy + sh) >= (y + int(h * 0.55)):
-                protect_bottom = True
-                break
-
-        def _scan_side(side: str) -> int:
-            if side in ('left', 'right'):
-                max_scan = max(8, min(48, int(float(w) * 0.10)))
-                strip = max(2, min(5, int(float(w) * 0.012) or 2))
-                blank_run_need = max(4, int(float(w) * 0.012))
-                limit = max(0, min(max_scan, w - max(80, int(float(w) * 0.62))))
-            else:
-                max_scan = max(8, min(56, int(float(h) * 0.16 if side == 'bottom' else float(h) * 0.10)))
-                strip = max(2, min(5, int(float(h) * 0.012) or 2))
-                blank_run_need = max(4, int(float(h) * 0.012))
-                limit = max(0, min(max_scan, h - max(90, int(float(h) * 0.58))))
-
-            if limit <= 0:
-                return 0
-
-            seen_signal = False
-            blank_run = 0
-            for offset in range(0, int(limit)):
-                if side == 'left':
-                    region = mask[:, offset:min(w, offset + strip)]
-                elif side == 'right':
-                    start = max(0, w - offset - strip)
-                    region = mask[:, start:max(0, w - offset)]
-                elif side == 'top':
-                    region = mask[offset:min(h, offset + strip), :]
-                else:
-                    start = max(0, h - offset - strip)
-                    region = mask[start:max(0, h - offset), :]
-
-                if region is None or getattr(region, 'size', 0) == 0:
-                    break
-                density = float(cv2.countNonZero(region)) / float(max(1, region.shape[0] * region.shape[1]))
-                if density >= signal_thr:
-                    seen_signal = True
-                    blank_run = 0
-                    continue
-                if seen_signal and density <= blank_thr:
-                    blank_run += 1
-                    if blank_run >= blank_run_need:
-                        return max(0, offset - blank_run + 1)
-                elif seen_signal:
-                    blank_run = 0
-            return 0
-
-        left_trim = _scan_side('left')
-        right_trim = _scan_side('right')
-        top_trim = _scan_side('top')
-        bottom_trim = 0 if protect_bottom else _scan_side('bottom')
-
-        current_bottom = y + h
-        proposed_bottom = current_bottom - bottom_trim
-        floor_value: Optional[int] = None
-        try:
-            if semantic_safety_floor is not None:
-                floor_value = int(semantic_safety_floor)
-        except Exception:
-            floor_value = None
-
-        if floor_value is not None and proposed_bottom < floor_value:
-            removed_top = max(y, proposed_bottom)
-            removed_bottom = current_bottom
-            interval_has_semantic_content = False
-
-            for sx, sy, sw, sh in relevant_support:
-                if sw <= 0 or sh <= 0:
-                    continue
-                if _bbox_overlap_1d(x, x + w, sx, sx + sw) < max(18, int(min(w, sw) * 0.18)):
-                    continue
-                if (sy + sh) <= removed_top or sy >= removed_bottom:
-                    continue
-                interval_has_semantic_content = True
-                break
-
-            if not interval_has_semantic_content:
-                for text_block in (semantic_text_boxes or page_text_boxes or []):
-                    try:
-                        tx, ty, tw, th = text_block.get('bbox', (0, 0, 0, 0))
-                    except Exception:
-                        continue
-                    if tw <= 0 or th <= 0:
-                        continue
-                    x_overlap = _bbox_overlap_1d(x, x + w, tx, tx + tw)
-                    if x_overlap < max(24, int(min(w, tw) * 0.16)):
-                        continue
-                    if (ty + th) <= removed_top or ty >= removed_bottom:
-                        continue
-                    interval_has_semantic_content = True
-                    break
-
-            if not interval_has_semantic_content:
-                interval_has_semantic_content = _removed_bottom_band_has_text_like_signal(
-                    page_cv,
-                    (int(x), int(removed_top), int(w), int(max(1, removed_bottom - removed_top))),
-                )
-
-            if interval_has_semantic_content:
-                bottom_trim = max(0, current_bottom - floor_value)
-                proposed_bottom = current_bottom - bottom_trim
-                _trace_avoidance_debug(
-                    debug_context,
-                    f"stage=shrink_semantic_floor floor={floor_value} y_max={proposed_bottom}",
-                )
-
-        if left_trim <= 0 and right_trim <= 0 and top_trim <= 0 and bottom_trim <= 0:
-            return (x, y, w, h)
-
-        nx = x + left_trim
-        ny = y + top_trim
-        nw = w - left_trim - right_trim
-        nh = h - top_trim - bottom_trim
-        if nw < max(100, int(float(w) * 0.62)) or nh < max(100, int(float(h) * 0.58)):
-            return (x, y, w, h)
-        return _clip_xywh_to_page(nx, ny, nw, nh, pw, ph)
-    except Exception:
-        return bbox
-
-
-def _removed_bottom_band_has_text_like_signal(
-    page_cv,
-    region_bbox: Tuple[int, int, int, int],
-) -> bool:
-    if page_cv is None or not (_HAS_NUMPY and _HAS_CV2):
-        return False
-    try:
-        ph, pw = page_cv.shape[:2]
-        x, y, w, h = _clip_xywh_to_page(*region_bbox, pw, ph)
-        if w < 80 or h < 12:
-            return False
-
-        roi = page_cv[y:y + h, x:x + w]
-        if roi is None or getattr(roi, 'size', 0) == 0:
-            return False
-
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        inv = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            31,
-            9,
-        )
-        kernel_w = max(18, min(64, int(float(w) * 0.08)))
-        text_lines = cv2.morphologyEx(
-            inv,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 3)),
-            iterations=1,
-        )
-        text_lines = cv2.morphologyEx(
-            text_lines,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2)),
-            iterations=1,
-        )
-
-        contours, _hier = cv2.findContours(text_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        line_hits = 0
-        for cnt in contours:
-            lx, ly, lw, lh = cv2.boundingRect(cnt)
-            if lw < max(28, int(float(w) * 0.12)):
-                continue
-            if lh > max(28, int(float(h) * 0.82)):
-                continue
-            if ly + lh < max(6, int(float(h) * 0.18)):
-                continue
-            patch = text_lines[ly:ly + lh, lx:lx + lw]
-            if patch is None or patch.size == 0:
-                continue
-            fill = float(cv2.countNonZero(patch)) / float(max(1, lw * lh))
-            if fill < 0.045:
-                continue
-            line_hits += 1
-            if line_hits >= 1:
-                return True
-        return False
-    except Exception:
-        return False
-
-
-def _detect_top_text_band_cut(
-    page_cv,
-    bbox: Tuple[int, int, int, int],
-) -> Optional[int]:
-    if page_cv is None or not (_HAS_NUMPY and _HAS_CV2):
-        return None
-    try:
-        ph, pw = page_cv.shape[:2]
-        x, y, w, h = _clip_xywh_to_page(*bbox, pw, ph)
-        if w < 120 or h < 120:
-            return None
-
-        band_h = max(34, min(120, int(float(h) * 0.22)))
-        roi = page_cv[y:y + band_h, x:x + w]
-        if roi is None or getattr(roi, 'size', 0) == 0:
-            return None
-
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        inv = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            31,
-            9,
-        )
-        kernel_w = max(18, min(72, int(float(w) * 0.10)))
-        text_lines = cv2.morphologyEx(
-            inv,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 3)),
-            iterations=1,
-        )
-        text_lines = cv2.morphologyEx(
-            text_lines,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2)),
-            iterations=1,
-        )
-
-        contours, _hier = cv2.findContours(text_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        text_bottom = -1
-        for cnt in contours:
-            lx, ly, lw, lh = cv2.boundingRect(cnt)
-            if lw < max(28, int(float(w) * 0.18)):
-                continue
-            if lh > max(26, int(float(band_h) * 0.55)):
-                continue
-            if ly > max(24, int(float(band_h) * 0.42)):
-                continue
-            patch = text_lines[ly:ly + lh, lx:lx + lw]
-            if patch is None or patch.size == 0:
-                continue
-            fill = float(cv2.countNonZero(patch)) / float(max(1, lw * lh))
-            if fill < 0.045:
-                continue
-            text_bottom = max(text_bottom, ly + lh)
-
-        if text_bottom <= 0:
-            return None
-        candidate_top = y + int(text_bottom) + TEXT_TRIM_MARGIN_PX
-        if candidate_top >= y + max(80, int(float(h) * 0.36)):
-            return None
-        return candidate_top
-    except Exception:
-        return None
-
-
-def _should_use_image_row_trim(
-    bbox: Tuple[int, int, int, int],
-    page_area: Optional[float],
-    kind: str = 'figure',
-) -> bool:
-    try:
-        _x, _y, w, h = bbox
-        if kind in ('figure', 'equation'):
-            # Avoid over-trimming wide figure crops where tiny lower labels can
-            # look like text rows but are still part of the visual.
-            if int(h) >= int(float(w) * 0.75):
-                return True
-            if page_area:
-                cand_ratio = (float(w) * float(h)) / float(page_area)
-                if cand_ratio >= 0.24 and int(h) >= int(float(w) * 0.50):
-                    return True
-            return False
-
-        if int(h) >= int(float(w) * 0.62):
-            return True
-        if page_area:
-            cand_ratio = (float(w) * float(h)) / float(page_area)
-            if cand_ratio >= 0.18:
-                return True
-    except Exception:
-        return False
-    return False
-
-
-def _should_trace_avoidance_debug(debug_context: str = '') -> bool:
-    try:
-        trace_flag = str(os.environ.get('PDF_AVOIDANCE_TRACE') or '').strip().lower()
-        if trace_flag not in {'1', 'true', 'yes', 'on'}:
-            return False
-        trace_filter = str(os.environ.get('PDF_AVOIDANCE_TRACE_FILTER') or '').strip()
-        if trace_filter and trace_filter not in (debug_context or ''):
-            return False
-        return True
-    except Exception:
-        return False
-
-
-def _trace_avoidance_debug(debug_context: str, message: str) -> None:
-    if not _should_trace_avoidance_debug(debug_context):
-        return
-    try:
-        prefix = f"[TRACE-AVOID] {debug_context}".strip()
-        _print_utf(f"{prefix} {message}".strip())
-    except Exception:
-        pass
-
-
-def _iteratively_refine_visual_bbox(
-    page_cv,
-    anchor_bbox: Tuple[int, int, int, int],
-    candidate_bbox: Tuple[int, int, int, int],
-    page_text_boxes: List[Dict],
-    avoidance_constraints: Optional[List[Dict]],
-    kind: str,
-    page_w: int,
-    page_h: int,
-    page_area: Optional[float],
-    debug_context: str = '',
-) -> Tuple[int, int, int, int]:
-    current = candidate_bbox
-    try:
-        _trace_avoidance_debug(
-            debug_context,
-            f"stage=refine_entry bbox={candidate_bbox} y_max={int(candidate_bbox[1]) + int(candidate_bbox[3])}",
-        )
-        for _ in range(3):
-            prev = current
-            cx, cy, cw, ch = current
-            if page_w > 0 and page_h > 0:
-                cx, cy, cw, ch = _clip_xywh_to_page(int(cx), int(cy), int(cw), int(ch), int(page_w), int(page_h))
-            if kind in ('figure', 'equation'):
-                if page_h > 0:
-                    cx, cy, cw, ch = _trim_visual_bbox_with_text_boxes((cx, cy, cw, ch), page_text_boxes, kind, int(page_h))
-                if page_cv is not None and _should_use_image_row_trim((cx, cy, cw, ch), page_area, kind):
-                    cx, cy, cw, ch = _trim_visual_bbox_with_image_rows(page_cv, (cx, cy, cw, ch), kind)
-            if page_w > 0 and page_h > 0:
-                cx, cy, cw, ch = _clamp_visual_bbox_growth(anchor_bbox, (cx, cy, cw, ch), kind, int(page_w), int(page_h))
-            current = (int(cx), int(cy), int(cw), int(ch))
-            if current == prev:
-                break
-    except Exception:
-        return candidate_bbox
-
-    try:
-        if kind in ('figure', 'equation') and avoidance_constraints and page_w > 0 and page_h > 0:
-            cx, cy, cw, ch = current
-            if cw > 0 and ch > 0:
-                current_top = cy
-                current_bottom = cy + ch
-                anchor_top = int(anchor_bbox[1])
-                anchor_bottom = int(anchor_bbox[1]) + int(anchor_bbox[3])
-                anchor_h = max(1, int(anchor_bbox[3]))
-                top_band_bottom = cy + int(float(ch) * 0.28)
-                bottom_band_top = cy + int(float(ch) * 0.72)
-                proximity_limit = max(6, min(24, int(float(ch) * 0.05)))
-                intrusion_limit = max(proximity_limit, min(36, int(float(ch) * 0.12)))
-                min_overlap_px = max(48, int(float(cw) * 0.40))
-                anchor_guard = max(6, int(float(anchor_h) * 0.04))
-                target_text_bottom: Optional[int] = None
-                target_text_top: Optional[int] = None
-
-                _trace_avoidance_debug(
-                    debug_context,
-                    f"start current={current} anchor={anchor_bbox} constraints={len(avoidance_constraints or [])} "
-                    f"top_band_bottom={top_band_bottom} bottom_band_top={bottom_band_top} "
-                    f"min_overlap_px={min_overlap_px} proximity_limit={proximity_limit} intrusion_limit={intrusion_limit}"
-                )
-
-                for constraint_index, constraint in enumerate(avoidance_constraints or []):
-                    tx, ty, tw, th = constraint.get('bbox', (0, 0, 0, 0))
-                    constraint_type = str(constraint.get('type') or '')
-                    constraint_source = str(constraint.get('source') or '')
-                    _trace_avoidance_debug(
-                        debug_context,
-                        f"candidate[{constraint_index}] bbox={(tx, ty, tw, th)} type={constraint_type} source={constraint_source}"
-                    )
-                    if tw <= 0 or th <= 0:
-                        _trace_avoidance_debug(debug_context, f"candidate[{constraint_index}] reject=invalid_bbox")
-                        continue
-
-                    x_overlap = _bbox_overlap_1d(cx, cx + cw, tx, tx + tw)
-                    crop_overlap_ratio = float(x_overlap) / float(max(1, cw))
-                    text_overlap_ratio = float(x_overlap) / float(max(1, tw))
-                    generic_reasons: List[str] = []
-                    top_reasons: List[str] = []
-                    bottom_reasons: List[str] = []
-                    if x_overlap < min_overlap_px:
-                        generic_reasons.append(f"Horizontal overlap px {x_overlap} < {min_overlap_px}")
-                    if crop_overlap_ratio < 0.40:
-                        generic_reasons.append(f"Crop overlap ratio {crop_overlap_ratio:.3f} < 0.400")
-                    if text_overlap_ratio < 0.55:
-                        generic_reasons.append(f"Constraint overlap ratio {text_overlap_ratio:.3f} < 0.550")
-                    if generic_reasons:
-                        _trace_avoidance_debug(
-                            debug_context,
-                            f"candidate[{constraint_index}] reject_generic=" + '; '.join(generic_reasons)
-                        )
-                        continue
-
-                    constraint_bottom = int(ty) + int(th)
-                    top_edge_delta = int(current_top) - int(constraint_bottom)
-                    top_hit = False
-                    if constraint_bottom <= top_band_bottom and constraint_bottom <= (anchor_top + anchor_guard):
-                        if top_edge_delta <= proximity_limit and abs(top_edge_delta) <= intrusion_limit:
-                            candidate_top = int(constraint_bottom) + TEXT_TRIM_MARGIN_PX
-                            top_trim_ratio = float(max(0, candidate_top - int(cy))) / float(max(1, ch))
-                            if top_trim_ratio <= 0.20:
-                                top_hit = True
-                                if target_text_bottom is None or int(constraint_bottom) > target_text_bottom:
-                                    target_text_bottom = int(constraint_bottom)
-                                _trace_avoidance_debug(
-                                    debug_context,
-                                    f"candidate[{constraint_index}] top_hit candidate_top={candidate_top} top_trim_ratio={top_trim_ratio:.3f}"
-                                )
-                            else:
-                                top_reasons.append(f"Top trim ratio {top_trim_ratio:.3f} > 0.200")
-                        else:
-                            if top_edge_delta > proximity_limit:
-                                top_reasons.append(f"Top distance {top_edge_delta} > {proximity_limit}")
-                            if abs(top_edge_delta) > intrusion_limit:
-                                top_reasons.append(f"Top abs distance {abs(top_edge_delta)} > {intrusion_limit}")
-                    else:
-                        if constraint_bottom > top_band_bottom:
-                            top_reasons.append(f"Top band miss: constraint_bottom {constraint_bottom} > {top_band_bottom}")
-                        if constraint_bottom > (anchor_top + anchor_guard):
-                            top_reasons.append(
-                                f"Top anchor guard miss: constraint_bottom {constraint_bottom} > {anchor_top + anchor_guard}"
-                            )
-
-                    edge_delta = int(ty) - int(current_bottom)
-                    bottom_hit = False
-                    if ty >= bottom_band_top and ty >= (anchor_bottom - anchor_guard):
-                        if edge_delta <= proximity_limit and abs(edge_delta) <= intrusion_limit:
-                            candidate_bottom = int(ty) - TEXT_TRIM_MARGIN_PX
-                            new_h = candidate_bottom - int(cy)
-                            if new_h > 0:
-                                area_reduction_ratio = 1.0 - (float(new_h) / float(max(1, ch)))
-                                if area_reduction_ratio <= 0.20:
-                                    bottom_hit = True
-                                    if target_text_top is None or int(ty) < target_text_top:
-                                        target_text_top = int(ty)
-                                    _trace_avoidance_debug(
-                                        debug_context,
-                                        f"candidate[{constraint_index}] bottom_hit candidate_bottom={candidate_bottom} area_reduction_ratio={area_reduction_ratio:.3f}"
-                                    )
-                                else:
-                                    bottom_reasons.append(f"Area reduction {area_reduction_ratio:.3f} > 0.200")
-                            else:
-                                bottom_reasons.append(f"Candidate bottom {candidate_bottom} <= current top {cy}")
-                        else:
-                            if edge_delta > proximity_limit:
-                                bottom_reasons.append(f"Bottom distance {edge_delta} > {proximity_limit}")
-                            if abs(edge_delta) > intrusion_limit:
-                                bottom_reasons.append(f"Bottom abs distance {abs(edge_delta)} > {intrusion_limit}")
-                    else:
-                        if ty < bottom_band_top:
-                            bottom_reasons.append(f"Bottom band miss: text_top {ty} < {bottom_band_top}")
-                        if ty < (anchor_bottom - anchor_guard):
-                            bottom_reasons.append(
-                                f"Bottom anchor guard miss: text_top {ty} < {anchor_bottom - anchor_guard}"
-                            )
-
-                    if not top_hit and not bottom_hit:
-                        _trace_avoidance_debug(
-                            debug_context,
-                            f"candidate[{constraint_index}] no_clamp top_reasons=" + '; '.join(top_reasons or ['none']) +
-                            " | bottom_reasons=" + '; '.join(bottom_reasons or ['none'])
-                        )
-
-                proposed_top = int(cy)
-                proposed_bottom = int(current_bottom)
-                if target_text_bottom is not None:
-                    proposed_top = max(proposed_top, int(target_text_bottom) + TEXT_TRIM_MARGIN_PX)
-                if target_text_top is not None:
-                    proposed_bottom = min(proposed_bottom, int(target_text_top) - TEXT_TRIM_MARGIN_PX)
-                new_h = proposed_bottom - proposed_top
-                if new_h > 0:
-                    area_reduction_ratio = 1.0 - (float(new_h) / float(max(1, ch)))
-                    if new_h > 0:
-                        if area_reduction_ratio <= 0.20:
-                            _trace_avoidance_debug(
-                                debug_context,
-                                f"apply_clamp proposed_top={proposed_top} proposed_bottom={proposed_bottom} new_h={new_h} area_reduction_ratio={area_reduction_ratio:.3f}"
-                            )
-                            current = _clip_xywh_to_page(int(cx), int(proposed_top), int(cw), int(new_h), int(page_w), int(page_h))
-                        else:
-                            _trace_avoidance_debug(
-                                debug_context,
-                                f"skip_final_clamp area_reduction_ratio={area_reduction_ratio:.3f} > 0.200 proposed_top={proposed_top} proposed_bottom={proposed_bottom}"
-                            )
-                else:
-                    _trace_avoidance_debug(debug_context, "no_surviving_constraints_after_filtering")
-    except Exception:
-        return current
-    try:
-        _trace_avoidance_debug(
-            debug_context,
-            f"stage=refine_exit bbox={current} y_max={int(current[1]) + int(current[3])}",
-        )
-    except Exception:
-        pass
-    return current
-
-
-def _figure_box_looks_self_contained(page_cv, bbox: Tuple[int, int, int, int]) -> bool:
-    if page_cv is None or not (_HAS_NUMPY and _HAS_CV2):
-        return True
-    try:
-        page_h, page_w = page_cv.shape[:2]
-        x, y, w, h = _clip_xywh_to_page(*bbox, page_w, page_h)
-        if w < 120 or h < 120:
-            return True
-        roi = page_cv[y:y + h, x:x + w]
-        if roi is None or getattr(roi, 'size', 0) == 0:
-            return True
-        mask = _build_visual_signal_mask(roi)
-        if mask is None or getattr(mask, 'size', 0) == 0:
-            return True
-
-        overall_density = float(cv2.countNonZero(mask)) / float(max(1, mask.shape[0] * mask.shape[1]))
-        if overall_density <= 0.010:
-            return True
-
-        edge_w = max(6, int(float(w) * 0.035))
-        edge_h = max(6, int(float(h) * 0.035))
-        top = mask[:edge_h, :]
-        bottom = mask[max(0, h - edge_h):, :]
-        left = mask[:, :edge_w]
-        right = mask[:, max(0, w - edge_w):]
-
-        def _density(region) -> float:
-            return float(cv2.countNonZero(region)) / float(max(1, region.shape[0] * region.shape[1]))
-
-        threshold = max(0.028, overall_density * 1.45)
-        strong_edges = sum(
-            1
-            for region in (top, bottom, left, right)
-            if _density(region) >= threshold
-        )
-        if strong_edges >= 3:
-            return False
-    except Exception:
-        return True
-    return True
 
 
 def _render_page_to_jpeg_bytes(page: fitz.Page, max_width: Optional[int] = None, quality: int = 85, dpi: int = 300) -> bytes:
@@ -3395,7 +1569,7 @@ def _infer_red_annotation_visual_type(
     crop_bytes: bytes,
     *,
     ocr_engine: str = 'auto',
-    repeated_watermark_candidates: Optional[Set[str]] = None,
+    repeated_watermark_candidates: Optional[set] = None,
 ) -> str:
     if not crop_bytes:
         return 'figure'
@@ -3446,7 +1620,7 @@ def _detect_red_annotation_layout_blocks(
     image_bytes: bytes,
     *,
     ocr_engine: str = 'auto',
-    repeated_watermark_candidates: Optional[Set[str]] = None,
+    repeated_watermark_candidates: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
@@ -3701,35 +1875,6 @@ def _extract_blue_annotation_boxes_from_page(
     return boxes
 
 
-def _bbox_intersection_area_xywh(
-    a: Tuple[int, int, int, int],
-    b: Tuple[int, int, int, int],
-) -> int:
-    try:
-        ax, ay, aw, ah = [int(v) for v in a]
-        bx, by, bw, bh = [int(v) for v in b]
-        x0 = max(ax, bx)
-        y0 = max(ay, by)
-        x1 = min(ax + aw, bx + bw)
-        y1 = min(ay + ah, by + bh)
-        if x1 <= x0 or y1 <= y0:
-            return 0
-        return int((x1 - x0) * (y1 - y0))
-    except Exception:
-        return 0
-
-
-def _bbox_overlap_ratio_xywh(
-    inner: Tuple[int, int, int, int],
-    outer: Tuple[int, int, int, int],
-) -> float:
-    try:
-        _x, _y, iw, ih = [int(v) for v in inner]
-        inner_area = max(1, iw * ih)
-        return float(_bbox_intersection_area_xywh(inner, outer)) / float(inner_area)
-    except Exception:
-        return 0.0
-
 
 def _should_preserve_text_from_red_exclusion(text_box: Dict) -> bool:
     """Keep numbered headings and prose paragraphs that loosely overlap red crop frames."""
@@ -3743,7 +1888,7 @@ def _should_preserve_text_from_red_exclusion(text_box: Dict) -> bool:
         return True
     if re.match(r'^[一二三四五六七八九十百千]+[、,，.．]', compact):
         return True
-    if len(compact) >= BLUE_ANNOTATION_BODY_PRESERVE_MIN_CHARS and not _is_likely_pdf_callout_or_annotation(text):
+    if len(compact) >= BLUE_ANNOTATION_BODY_PRESERVE_MIN_CHARS and not is_likely_pdf_callout_or_annotation(text):
         return True
     return False
 
@@ -3815,25 +1960,6 @@ def _filter_text_boxes_excluding_regions(
     return kept
 
 
-def _bbox_center_inside_region(
-    inner: Tuple[int, int, int, int],
-    outer: Tuple[int, int, int, int],
-    *,
-    min_center_overlap_ratio: float = 0.65,
-) -> bool:
-    try:
-        x, y, w, h = [int(v) for v in inner]
-        cx = x + w / 2.0
-        cy = y + h / 2.0
-        ox, oy, ow, oh = [int(v) for v in outer]
-        if ow <= 0 or oh <= 0:
-            return False
-        if cx < ox or cy < oy or cx > ox + ow or cy > oy + oh:
-            return False
-        return _bbox_overlap_ratio_xywh(inner, outer) >= float(min_center_overlap_ratio)
-    except Exception:
-        return False
-
 
 def _filter_ocr_callouts_inside_visual_crops(
     boxes: List[Dict],
@@ -3862,7 +1988,7 @@ def _filter_ocr_callouts_inside_visual_crops(
             kept.append(box)
             continue
         inside_crop = any(_bbox_center_inside_region(inner, region) for region in crop_regions)
-        if inside_crop and _is_likely_pdf_callout_or_annotation(text):
+        if inside_crop and is_likely_pdf_callout_or_annotation(text):
             continue
         kept.append(box)
     return kept
@@ -4019,564 +2145,8 @@ def _line_evidence_from_crop_bytes(
         return (0, 0, 0)
 
 
-def _count_line_intersections(
-    h_lines: List[Tuple[int, int, int, int]],
-    v_lines: List[Tuple[int, int, int, int]],
-    tol: int = 3,
-) -> int:
-    """Count approximate intersections between horizontal and vertical lines."""
-    if not h_lines or not v_lines:
-        return 0
-    count = 0
-    for x1h, y1h, x2h, y2h in h_lines:
-        hy = int((y1h + y2h) / 2)
-        hmin, hmax = (x1h, x2h) if x1h <= x2h else (x2h, x1h)
-        for x1v, y1v, x2v, y2v in v_lines:
-            vx = int((x1v + x2v) / 2)
-            vmin, vmax = (y1v, y2v) if y1v <= y2v else (y2v, y1v)
-            if (hmin - tol) <= vx <= (hmax + tol) and (vmin - tol) <= hy <= (vmax + tol):
-                count += 1
-    return count
 
 
-def _bbox_iou_xywh(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    """Compute IoU for two boxes in (x, y, w, h) format."""
-    try:
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        ax2 = ax + aw
-        ay2 = ay + ah
-        bx2 = bx + bw
-        by2 = by + bh
-
-        ix1 = max(ax, bx)
-        iy1 = max(ay, by)
-        ix2 = min(ax2, bx2)
-        iy2 = min(ay2, by2)
-        iw = max(0, ix2 - ix1)
-        ih = max(0, iy2 - iy1)
-        inter = float(iw * ih)
-        if inter <= 0.0:
-            return 0.0
-
-        area_a = float(max(0, aw) * max(0, ah))
-        area_b = float(max(0, bw) * max(0, bh))
-        denom = area_a + area_b - inter
-        if denom <= 0.0:
-            return 0.0
-        return inter / denom
-    except Exception:
-        return 0.0
-
-
-def _bbox_inside_xywh(inner: Tuple[int, int, int, int], outer: Tuple[int, int, int, int], margin: int = 6) -> bool:
-    """Return True when `inner` is almost contained by `outer` (with margin)."""
-    try:
-        ix, iy, iw, ih = inner
-        ox, oy, ow, oh = outer
-        return (
-            ix >= (ox - margin)
-            and iy >= (oy - margin)
-            and (ix + iw) <= (ox + ow + margin)
-            and (iy + ih) <= (oy + oh + margin)
-        )
-    except Exception:
-        return False
-
-
-def _bbox_coverage_xywh(inner: Tuple[int, int, int, int], outer: Tuple[int, int, int, int]) -> float:
-    try:
-        ix, iy, iw, ih = inner
-        ox, oy, ow, oh = outer
-        inter_w = _bbox_overlap_1d(ix, ix + iw, ox, ox + ow)
-        inter_h = _bbox_overlap_1d(iy, iy + ih, oy, oy + oh)
-        inter_area = float(max(0, inter_w * inter_h))
-        inner_area = float(max(1, iw * ih))
-        return inter_area / inner_area
-    except Exception:
-        return 0.0
-
-
-def _suppress_nested_figure_boxes(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
-    """Keep complete figure boxes and suppress substantially covered fragments."""
-    if len(boxes) < 2:
-        return list(boxes)
-
-    try:
-        ordered = sorted(boxes, key=lambda b: (-(b[2] * b[3]), b[1], b[0]))
-    except Exception:
-        ordered = list(boxes)
-
-    kept: List[Tuple[int, int, int, int]] = []
-    for cand in ordered:
-        try:
-            cand_area = float(max(1, cand[2] * cand[3]))
-        except Exception:
-            continue
-
-        drop = False
-        for parent in kept:
-            try:
-                parent_area = float(max(1, parent[2] * parent[3]))
-                area_ratio = cand_area / parent_area
-                coverage = _bbox_coverage_xywh(cand, parent)
-                if coverage >= 0.78 and area_ratio <= 0.62:
-                    drop = True
-                    break
-                if _bbox_inside_xywh(cand, parent, margin=18) and area_ratio <= 0.80:
-                    drop = True
-                    break
-            except Exception:
-                continue
-        if not drop:
-            kept.append(cand)
-
-    try:
-        kept = sorted(kept, key=lambda b: (b[1], b[0]))
-    except Exception:
-        pass
-    return kept
-
-
-def _suppress_compound_parent_figure_boxes(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
-    if len(boxes) < 3:
-        return list(boxes)
-
-    try:
-        ordered = sorted(boxes, key=lambda b: (-(b[2] * b[3]), b[1], b[0]))
-    except Exception:
-        ordered = list(boxes)
-
-    kept: List[Tuple[int, int, int, int]] = []
-    for idx, cand in enumerate(ordered):
-        try:
-            cx, cy, cw, ch = cand
-            cand_area = float(max(1, cw * ch))
-        except Exception:
-            kept.append(cand)
-            continue
-
-        support_boxes: List[Tuple[int, int, int, int]] = []
-        covered_area = 0.0
-        for jdx, other in enumerate(ordered):
-            if idx == jdx:
-                continue
-            try:
-                ox, oy, ow, oh = other
-                other_area = float(max(1, ow * oh))
-                if other_area >= cand_area * 0.90:
-                    continue
-                inter_w = _bbox_overlap_1d(cx, cx + cw, ox, ox + ow)
-                inter_h = _bbox_overlap_1d(cy, cy + ch, oy, oy + oh)
-                inter_area = float(max(0, inter_w * inter_h))
-                if inter_area < cand_area * 0.18:
-                    continue
-                support_boxes.append(other)
-                covered_area += inter_area
-            except Exception:
-                continue
-
-        drop = False
-        if len(support_boxes) >= 2 and covered_area >= cand_area * 0.88:
-            x_centers = [float(b[0]) + (float(b[2]) * 0.5) for b in support_boxes]
-            y_centers = [float(b[1]) + (float(b[3]) * 0.5) for b in support_boxes]
-            if (max(y_centers) - min(y_centers)) >= max(90.0, float(ch) * 0.18):
-                drop = True
-            elif (max(x_centers) - min(x_centers)) >= max(90.0, float(cw) * 0.18):
-                drop = True
-
-        if not drop:
-            kept.append(cand)
-
-    try:
-        kept = sorted(kept, key=lambda b: (b[1], b[0]))
-    except Exception:
-        pass
-    return kept
-
-
-def _is_nested_figure_fragment(candidate: Tuple[int, int, int, int], kept_boxes: List[Tuple[int, int, int, int]]) -> bool:
-    if not kept_boxes:
-        return False
-    try:
-        cand_area = float(max(1, candidate[2] * candidate[3]))
-    except Exception:
-        return False
-
-    for kept in kept_boxes:
-        try:
-            kept_area = float(max(1, kept[2] * kept[3]))
-            area_ratio = cand_area / kept_area
-            coverage = _bbox_coverage_xywh(candidate, kept)
-            if coverage >= 0.78 and area_ratio <= 0.62:
-                return True
-            if _bbox_inside_xywh(candidate, kept, margin=18) and area_ratio <= 0.80:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _prune_overlapping_boxes(boxes: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
-    """Remove near-duplicate / nested CV boxes while preserving distinct regions."""
-    if not boxes:
-        return []
-    try:
-        ordered = sorted(boxes, key=lambda b: (-(b[2] * b[3]), b[1], b[0]))
-    except Exception:
-        ordered = list(boxes)
-
-    kept: List[Tuple[int, int, int, int]] = []
-    for cand in ordered:
-        try:
-            cx, cy, cw, ch = cand
-            if cw <= 0 or ch <= 0:
-                continue
-        except Exception:
-            continue
-
-        drop = False
-        for k in kept:
-            try:
-                iou = _bbox_iou_xywh(cand, k)
-                if iou >= 0.82:
-                    drop = True
-                    break
-                if _bbox_inside_xywh(cand, k, margin=8):
-                    drop = True
-                    break
-            except Exception:
-                continue
-        if not drop:
-            kept.append(cand)
-
-    try:
-        kept = sorted(kept, key=lambda b: (b[1], b[0]))
-    except Exception:
-        pass
-    return kept
-
-
-def _is_duplicate_crop_candidate(
-    candidate: Tuple[int, int, int, int],
-    kept_boxes: List[Tuple[int, int, int, int]],
-) -> bool:
-    if not kept_boxes:
-        return False
-    try:
-        cand_area = float(max(1, candidate[2] * candidate[3]))
-    except Exception:
-        return False
-    for kept in kept_boxes:
-        try:
-            kept_area = float(max(1, kept[2] * kept[3]))
-            iou = _bbox_iou_xywh(candidate, kept)
-            if iou >= 0.84:
-                return True
-            area_ratio = min(cand_area, kept_area) / max(cand_area, kept_area)
-            if area_ratio >= 0.78 and (_bbox_inside_xywh(candidate, kept, margin=10) or _bbox_inside_xywh(kept, candidate, margin=10)):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _suppress_redundant_layout_figure_blocks(layout_blocks: List[Dict]) -> List[Dict]:
-    if len(layout_blocks) < 3:
-        return layout_blocks
-
-    try:
-        figure_indices = [idx for idx, lb in enumerate(layout_blocks) if str(lb.get('type') or '').strip().lower() == 'figure']
-    except Exception:
-        return layout_blocks
-    if len(figure_indices) < 3:
-        return layout_blocks
-
-    drop_indices = set()
-    for idx in figure_indices:
-        try:
-            cand = layout_blocks[idx]
-            cb = cand.get('bbox', (0, 0, 0, 0))
-            cx, cy, cw, ch = (int(cb[0]), int(cb[1]), int(cb[2]), int(cb[3]))
-            cand_area = float(max(1, cw * ch))
-        except Exception:
-            continue
-
-        support_count = 0
-        covered_area = 0.0
-        x_centers: List[float] = []
-        y_centers: List[float] = []
-        for jdx in figure_indices:
-            if jdx == idx:
-                continue
-            try:
-                other = layout_blocks[jdx]
-                ob = other.get('bbox', (0, 0, 0, 0))
-                ox, oy, ow, oh = (int(ob[0]), int(ob[1]), int(ob[2]), int(ob[3]))
-                other_area = float(max(1, ow * oh))
-                if other_area >= cand_area * 0.90:
-                    continue
-                inter_w = _bbox_overlap_1d(cx, cx + cw, ox, ox + ow)
-                inter_h = _bbox_overlap_1d(cy, cy + ch, oy, oy + oh)
-                inter_area = float(max(0, inter_w * inter_h))
-                if inter_area < cand_area * 0.18:
-                    continue
-                support_count += 1
-                covered_area += inter_area
-                x_centers.append(float(ox) + (float(ow) * 0.5))
-                y_centers.append(float(oy) + (float(oh) * 0.5))
-            except Exception:
-                continue
-
-        if support_count < 2 or covered_area < cand_area * 0.88:
-            continue
-        if y_centers and (max(y_centers) - min(y_centers)) >= max(90.0, float(ch) * 0.18):
-            drop_indices.add(idx)
-            continue
-        if x_centers and (max(x_centers) - min(x_centers)) >= max(90.0, float(cw) * 0.18):
-            drop_indices.add(idx)
-
-    if not drop_indices:
-        return layout_blocks
-    return [lb for idx, lb in enumerate(layout_blocks) if idx not in drop_indices]
-
-
-def _merge_sidecar_figure_boxes(
-    boxes: List[Tuple[int, int, int, int]],
-    page_w: int = 0,
-    page_h: int = 0,
-) -> List[Tuple[int, int, int, int]]:
-    """Merge figure fragments when a narrow sidecar box belongs to the same drawing.
-
-    This targets engineering drawings that get split into a main crop plus a
-    narrow adjacent pillar / support strip. The rule stays conservative by
-    requiring strong vertical overlap, small horizontal gap, and a modest union
-    footprint relative to the full page.
-    """
-    if len(boxes) < 2:
-        return list(boxes)
-
-    try:
-        page_area = float(max(1, page_w * page_h)) if page_w > 0 and page_h > 0 else 0.0
-    except Exception:
-        page_area = 0.0
-
-    try:
-        merged = sorted(boxes, key=lambda b: (b[1], b[0]))
-    except Exception:
-        merged = list(boxes)
-
-    changed = True
-    while changed and len(merged) >= 2:
-        changed = False
-        for i in range(len(merged)):
-            ax, ay, aw, ah = merged[i]
-            ax1 = ax + aw
-            ay1 = ay + ah
-            for j in range(i + 1, len(merged)):
-                bx, by, bw, bh = merged[j]
-                bx1 = bx + bw
-                by1 = by + bh
-
-                overlap_h = _bbox_overlap_1d(ay, ay1, by, by1)
-                try:
-                    y_overlap_ratio = float(overlap_h) / float(max(1, min(ah, bh)))
-                except Exception:
-                    y_overlap_ratio = 0.0
-                if y_overlap_ratio < 0.58:
-                    continue
-
-                horizontal_gap = max(0, max(ax, bx) - min(ax1, bx1))
-                if horizontal_gap > max(110, int(min(aw, bw) * 0.24)):
-                    continue
-
-                try:
-                    width_ratio = float(min(aw, bw)) / float(max(aw, bw))
-                except Exception:
-                    width_ratio = 1.0
-                if width_ratio > 0.72 and min(aw, bw) > 220:
-                    continue
-
-                union_x0 = min(ax, bx)
-                union_y0 = min(ay, by)
-                union_x1 = max(ax1, bx1)
-                union_y1 = max(ay1, by1)
-                union_w = union_x1 - union_x0
-                union_h = union_y1 - union_y0
-                union_area = float(max(1, union_w * union_h))
-
-                inter_w = _bbox_overlap_1d(ax, ax1, bx, bx1)
-                inter_h = overlap_h
-                inter_area = float(max(0, inter_w * inter_h))
-                covered_area = float(max(1, aw * ah + bw * bh)) - inter_area
-                fill_ratio = covered_area / union_area
-
-                if fill_ratio < 0.46:
-                    continue
-                if page_area and (union_area / page_area) > 0.22:
-                    continue
-
-                merged[i] = (union_x0, union_y0, union_w, union_h)
-                del merged[j]
-                changed = True
-                break
-            if changed:
-                break
-
-    try:
-        merged = sorted(merged, key=lambda b: (b[1], b[0]))
-    except Exception:
-        pass
-    return merged
-
-
-def _merge_stacked_table_boxes(
-    boxes: List[Tuple[int, int, int, int]],
-    page_w: int = 0,
-    page_h: int = 0,
-) -> List[Tuple[int, int, int, int]]:
-    """Merge table fragments that are vertically stacked or overlapping with near-identical columns."""
-    if len(boxes) < 2:
-        return list(boxes)
-
-    try:
-        page_area = float(max(1, page_w * page_h)) if page_w > 0 and page_h > 0 else 0.0
-    except Exception:
-        page_area = 0.0
-
-    try:
-        merged = sorted(boxes, key=lambda b: (b[1], b[0]))
-    except Exception:
-        merged = list(boxes)
-
-    changed = True
-    while changed and len(merged) >= 2:
-        changed = False
-        for i in range(len(merged)):
-            ax, ay, aw, ah = merged[i]
-            ax1 = ax + aw
-            ay1 = ay + ah
-            acx = ax + (aw / 2.0)
-            for j in range(i + 1, len(merged)):
-                bx, by, bw, bh = merged[j]
-                bx1 = bx + bw
-                by1 = by + bh
-                bcx = bx + (bw / 2.0)
-
-                x_overlap = _bbox_overlap_1d(ax, ax1, bx, bx1)
-                try:
-                    x_overlap_ratio = float(x_overlap) / float(max(1, min(aw, bw)))
-                except Exception:
-                    x_overlap_ratio = 0.0
-                if x_overlap_ratio < 0.80:
-                    continue
-
-                try:
-                    width_ratio = float(min(aw, bw)) / float(max(aw, bw))
-                except Exception:
-                    width_ratio = 0.0
-                if width_ratio < 0.78:
-                    continue
-
-                center_offset = abs(acx - bcx)
-                if center_offset > max(18.0, float(min(aw, bw)) * 0.08):
-                    continue
-
-                overlap_v = _bbox_overlap_1d(ay, ay1, by, by1)
-                vertical_gap = max(0, max(ay, by) - min(ay1, by1))
-                if overlap_v <= 0 and vertical_gap > max(12, int(min(ah, bh) * 0.10)):
-                    continue
-
-                strong_column_alignment = (
-                    x_overlap_ratio >= 0.95
-                    and width_ratio >= 0.95
-                    and center_offset <= max(10.0, float(min(aw, bw)) * 0.04)
-                    and vertical_gap <= 2
-                )
-
-                union_x0 = min(ax, bx)
-                union_y0 = min(ay, by)
-                union_x1 = max(ax1, bx1)
-                union_y1 = max(ay1, by1)
-                union_w = union_x1 - union_x0
-                union_h = union_y1 - union_y0
-                max_union_height_ratio = 2.25 if strong_column_alignment else 1.85
-                if union_h > int(max(ah, bh) * max_union_height_ratio):
-                    continue
-
-                union_area = float(max(1, union_w * union_h))
-                inter_w = _bbox_overlap_1d(ax, ax1, bx, bx1)
-                inter_h = _bbox_overlap_1d(ay, ay1, by, by1)
-                inter_area = float(max(0, inter_w * inter_h))
-                covered_area = float(max(1, aw * ah + bw * bh)) - inter_area
-                fill_ratio = covered_area / union_area
-                if fill_ratio < 0.72:
-                    continue
-                max_page_ratio = 0.48 if strong_column_alignment else 0.34
-                if page_area and (union_area / page_area) > max_page_ratio:
-                    continue
-
-                merged[i] = (union_x0, union_y0, union_w, union_h)
-                del merged[j]
-                changed = True
-                break
-            if changed:
-                break
-
-    try:
-        merged = sorted(merged, key=lambda b: (b[1], b[0]))
-    except Exception:
-        pass
-    return merged
-
-
-def _page_has_structural_visual_signal(image_bytes: bytes) -> bool:
-    """Return True when a page has strong table/diagram-like line structure."""
-    if not (_HAS_CV2 and _HAS_NUMPY):
-        return False
-    try:
-        arr = np.frombuffer(image_bytes, dtype=np.uint8)
-        page = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if page is None:
-            return False
-
-        ph, pw = page.shape[:2]
-        gray = cv2.cvtColor(page, cv2.COLOR_BGR2GRAY)
-        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-        edges = cv2.Canny(th, 50, 150)
-        lines = cv2.HoughLinesP(
-            edges,
-            1,
-            np.pi / 180,
-            threshold=max(80, int(pw / 40)),
-            minLineLength=max(30, int(pw / 8)),
-            maxLineGap=8,
-        )
-        if lines is None:
-            return False
-
-        h_lines: List[Tuple[int, int, int, int]] = []
-        v_lines: List[Tuple[int, int, int, int]] = []
-        h_min = max(40, int(pw * 0.35))
-        v_min = max(40, int(ph * 0.25))
-
-        for ln in lines:
-            x1, y1, x2, y2 = ln[0]
-            dx = abs(x2 - x1)
-            dy = abs(y2 - y1)
-            if dy <= max(2, int(dx * 0.2)) and dx >= h_min:
-                h_lines.append((x1, y1, x2, y2))
-            elif dx <= max(2, int(dy * 0.2)) and dy >= v_min:
-                v_lines.append((x1, y1, x2, y2))
-
-        intersections = _count_line_intersections(h_lines, v_lines, tol=4)
-        return (
-            len(h_lines) >= FALLBACK_MIN_H_LONG
-            and len(v_lines) >= FALLBACK_MIN_V_LONG
-            and intersections >= FALLBACK_MIN_INTERSECTIONS
-        )
-    except Exception:
-        return False
 
 
 def _split_stacked_figure_bbox(
@@ -5516,7 +3086,7 @@ def _detect_layout_blocks(layout_res, image_bytes: bytes, table_threshold: float
             ocr_text_inner = ''
             text_count = 0
             avg_line_len = 0.0
-            table_rows_inner: Optional[List[List[str]]] = None
+            table_rows_inner: Optional[list] = None
             table_cols = 0
             try:
                 if crop_bytes is not None:
@@ -6191,7 +3761,7 @@ def _entry_text_lines_for_style_detection(entry: Dict[str, Any]) -> List[str]:
         if block_type in {'figure', 'table', 'image', 'equation'}:
             continue
         text = _extract_pdf_block_text(block)
-        if not text or _is_pdf_page_marker_text(text):
+        if not text or is_pdf_page_marker_text(text):
             continue
         for raw_line in str(text).splitlines():
             line = str(raw_line or '').strip()
@@ -6317,7 +3887,7 @@ def _extract_embedded_visual_caption_from_image_bytes(
     visual_type: str,
     *,
     ocr_engine: str = 'auto',
-    repeated_watermark_candidates: Optional[Set[str]] = None,
+    repeated_watermark_candidates: Optional[set] = None,
 ) -> str:
     if not image_bytes:
         return ''
@@ -6457,8 +4027,8 @@ def _find_nearby_visual_caption_candidate_with_meta(
     blocks: List[Dict[str, Any]],
     index: int,
     visual_type: str,
-    allowed_roles: Set[str],
-) -> Optional[Tuple[str, str]]:
+    allowed_roles: set,
+) -> Optional[tuple]:
     block_type = 'table' if visual_type == 'table' else 'figure'
 
     for neighbor_index in range(index - 1, -1, -1):
@@ -6503,68 +4073,13 @@ def _find_nearby_visual_caption_candidate(
     return res[0] if res else ''
 
 
-def _group_visual_composites(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Group figures/tables with their captions based on spatial proximity."""
-    if not blocks:
-        return []
-
-    out: List[Dict[str, Any]] = []
-    skip_indices = set()
-
-    for i, block in enumerate(blocks):
-        if i in skip_indices:
-            continue
-
-        typ = str(block.get('type') or '').lower()
-        if typ in ('figure', 'table', 'image'):
-            # Look for a caption nearby (usually the next block)
-            bbox = block.get('bbox')
-            if not bbox or not isinstance(bbox, dict):
-                out.append(block)
-                continue
-
-            found_caption = False
-            # Check next 2 blocks for proximity
-            for j in range(i + 1, min(i + 3, len(blocks))):
-                candidate = blocks[j]
-                if j in skip_indices:
-                    continue
-
-                role = str(candidate.get('semanticRole') or '').lower()
-                c_bbox = candidate.get('bbox')
-
-                if role == 'caption' and isinstance(c_bbox, dict):
-                    # Calculate vertical distance
-                    dist = abs(c_bbox.get('top', 0) - bbox.get('bottom', 0))
-                    if dist < 45: # Standard proximity threshold in points
-                        # Bind them
-                        block['parentFigureId'] = block.get('id') or f"fig_{i}"
-                        candidate['parentFigureId'] = block['parentFigureId']
-                        # Ensure ID stability if not present
-                        if not block.get('id'): block['id'] = block['parentFigureId']
-
-                        out.append(block)
-                        out.append(candidate)
-                        skip_indices.add(i)
-                        skip_indices.add(j)
-                        found_caption = True
-                        break
-
-            if not found_caption:
-                out.append(block)
-        else:
-            out.append(block)
-
-    return out
-
-
 def _normalize_pdf_entry_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     # Filter standalone artifacts between main figure and its potential caption
     def _is_noise_artifact(block: Dict) -> bool:
         role = str(block.get('semanticRole') or '').strip().lower()
         if role == 'artifact':
             text = _extract_pdf_block_text(block)
-            if _is_pdf_page_marker_text(text):
+            if is_pdf_page_marker_text(text):
                 return True
         return False
 
@@ -6578,7 +4093,6 @@ def _normalize_pdf_entry_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, 
 
     # Pre-filter artifacts that might break figure-caption proximity
     prepared = [b for b in prepared if not _is_noise_artifact(b)]
-    prepared = _group_visual_composites(prepared)
 
     normalized_blocks: List[Dict[str, Any]] = []
 
@@ -6785,68 +4299,81 @@ def _filter_standalone_part_label_blocks(blocks: List[Dict[str, Any]]) -> List[D
 
 
 def _detect_two_column_gutter_x(page_blocks: List[Dict[str, Any]]) -> Optional[float]:
-    """Detect a vertical gutter x-coordinate splitting a page's blocks into left/right columns."""
+    """Detect a vertical gutter x-coordinate splitting a page's blocks into left/right columns.
+
+    Returns the gutter x (midpoint of the widest horizontal gap between two block clusters)
+    when the page shows a confident two-column layout (both clusters have enough blocks and
+    their vertical spans overlap, i.e. they sit side-by-side rather than being header/footer
+    zones stacked vertically). Returns None otherwise so single-column pages are unaffected.
+    """
     intervals: List[Tuple[float, float, float, float]] = []
     for block in page_blocks:
         if not isinstance(block, dict):
             continue
-        bbox = block.get('bbox')
+        bbox = block.get('bbox') if isinstance(block.get('bbox'), dict) else None
         if not isinstance(bbox, dict):
             continue
         try:
-            left = float(bbox.get('left', 0))
-            width = float(bbox.get('width', 0))
-            top = float(bbox.get('top', 0))
-            height = float(bbox.get('height', 0))
-            if width <= 0 or height <= 0: continue
-            intervals.append((left, left + width, top, top + height))
-        except: continue
+            left = float(bbox.get('left'))
+            width = float(bbox.get('width'))
+            top = float(bbox.get('top'))
+            height = float(bbox.get('height'))
+        except Exception:
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        intervals.append((left, left + width, top, top + height))
 
-    if len(intervals) < 6: return None
+    if len(intervals) < 6:
+        return None
 
     min_left = min(i[0] for i in intervals)
     max_right = max(i[1] for i in intervals)
     page_width = max_right - min_left
-    if page_width < 200: return None
+    if page_width < 200:
+        return None
 
-    # Horizontal projection histogram
-    bins = 100
-    bin_w = page_width / bins
-    hist = [0] * bins
+    # Ignore blocks that already span most of the page width (headings, full-width paragraphs).
+    narrow = [i for i in intervals if (i[1] - i[0]) <= page_width * 0.62]
+    if len(narrow) < 6:
+        return None
 
-    narrow = [i for i in intervals if (i[1] - i[0]) <= page_width * 0.65]
-    if len(narrow) < 4: return None
+    spans = sorted(((i[0], i[1]) for i in narrow), key=lambda s: s[0])
+    merged: List[List[float]] = []
+    for s in spans:
+        if merged and s[0] <= merged[-1][1] + page_width * 0.01:
+            merged[-1][1] = max(merged[-1][1], s[1])
+        else:
+            merged.append([s[0], s[1]])
 
-    for i in narrow:
-        start_bin = int((i[0] - min_left) / bin_w)
-        end_bin = int((i[1] - min_left) / bin_w)
-        for b in range(max(0, start_bin), min(bins, end_bin + 1)):
-            hist[b] += 1
+    if len(merged) < 2:
+        return None
 
-    # Search for a deep valley in the middle 30-70% of the page
-    mid_start = int(bins * 0.3)
-    mid_end = int(bins * 0.7)
+    gaps = [(b[0] - a[1], a[1], b[0]) for a, b in zip(merged, merged[1:])]
+    gaps.sort(key=lambda g: -g[0])
+    best_gap_width, left_edge, right_edge = gaps[0]
+    if best_gap_width < max(12.0, page_width * 0.03):
+        return None
 
-    best_gutter_idx = -1
-    min_density = 999999
+    left_cluster = [i for i in narrow if i[1] <= left_edge + 1.0]
+    right_cluster = [i for i in narrow if i[0] >= right_edge - 1.0]
+    if len(left_cluster) < 3 or len(right_cluster) < 3:
+        return None
 
-    for b in range(mid_start, mid_end):
-        # Weight bin density by distance to center to prefer central gutters
-        dist_to_center = abs(b - bins/2) / (bins/2)
-        weighted_density = hist[b] * (1.0 + 0.5 * dist_to_center)
+    # Confirm the two clusters are truly side-by-side (their vertical ranges overlap).
+    left_top = min(i[2] for i in left_cluster)
+    left_bottom = max(i[3] for i in left_cluster)
+    right_top = min(i[2] for i in right_cluster)
+    right_bottom = max(i[3] for i in right_cluster)
+    overlap = min(left_bottom, right_bottom) - max(left_top, right_top)
+    if overlap <= 0:
+        return None
 
-        if weighted_density < min_density:
-            min_density = weighted_density
-            best_gutter_idx = b
-
-    if best_gutter_idx != -1 and hist[best_gutter_idx] <= max(1, sum(hist) / bins * 0.25):
-        return min_left + (best_gutter_idx + 0.5) * bin_w
-
-    return None
+    return (left_edge + right_edge) / 2.0
 
 
 def _assign_column_bands_for_document_order(blocks: List[Dict[str, Any]]) -> None:
-    """Tag each block with a transient `_docOrderColumn` (0/1) and `_docOrderBand`."""
+    """Tag each block with a transient `_docOrderColumn` (0/1) based on per-page column detection."""
     pages: Dict[Any, List[Dict[str, Any]]] = {}
     for block in blocks:
         if not isinstance(block, dict):
@@ -6855,72 +4382,19 @@ def _assign_column_bands_for_document_order(blocks: List[Dict[str, Any]]) -> Non
 
     for page_blocks in pages.values():
         gutter_x = _detect_two_column_gutter_x(page_blocks)
-
-        # Identify "Wide" blocks that act as vertical separators (break points)
-        # We need page width to determine "wide".
-        intervals = []
-        for b in page_blocks:
-            bbox = b.get('bbox')
-            if isinstance(bbox, dict):
-                try:
-                    intervals.append((float(bbox['left']), float(bbox['left']) + float(bbox['width']), float(bbox['top']), float(bbox['top']) + float(bbox['height'])))
-                except: pass
-        if not intervals: continue
-
-        max_r = max(i[1] for i in intervals)
-        min_l = min(i[0] for i in intervals)
-        pw = max_r - min_l
-
-        # Separators are blocks spanning > 75% of page width
-        separators = []
-        for b in page_blocks:
-            bbox = b.get('bbox')
-            if isinstance(bbox, dict):
-                try:
-                    w = float(bbox['width'])
-                    if w > pw * 0.75:
-                        separators.append(b)
-                except: pass
-
-        # Sort separators by top to create bands
-        separators.sort(key=lambda x: float(x.get('bbox', {}).get('top', 0)))
-
+        if gutter_x is None:
+            continue
         for block in page_blocks:
-            bbox = block.get('bbox')
+            bbox = block.get('bbox') if isinstance(block.get('bbox'), dict) else None
             if not isinstance(bbox, dict):
                 continue
             try:
-                top = float(bbox.get('top', 0))
-                left = float(bbox.get('left', 0))
-                width = float(bbox.get('width', 0))
-            except: continue
-
-            # Determine Band
-            band_idx = 0
-            for i, sep in enumerate(separators):
-                sep_top = float(sep.get('bbox', {}).get('top', 0))
-                if top > sep_top + 2.0: # Block is below this separator
-                    band_idx = i + 1
-            block['_docOrderBand'] = band_idx
-
-            # Determine Column within band (if not a separator itself)
-            if width > pw * 0.75 or gutter_x is None:
-                block['_docOrderColumn'] = 0
-            else:
-                center_x = left + width / 2.0
-                block['_docOrderColumn'] = 0 if center_x < gutter_x else 1
-
-
-def _block_sort_tuple_for_document_order(block: Dict[str, Any]) -> Tuple[int, int, int, int, int, int]:
-    bbox = block.get('bbox') if isinstance(block.get('bbox'), dict) else {}
-    return (
-        _safe_int(block.get('_docOrderBand')) or 0,
-        _block_document_order_tier(block),
-        _safe_int(block.get('_docOrderColumn')) or 0,
-        _safe_int(block.get('readingOrder')) or 10**9,
-        int(bbox.get('top', 10**9)),
-        int(bbox.get('left', 10**9)),
-    )
+                left = float(bbox.get('left'))
+                width = float(bbox.get('width'))
+            except Exception:
+                continue
+            center_x = left + width / 2.0
+            block['_docOrderColumn'] = 0 if center_x < gutter_x else 1
 
 
 def _block_document_order_tier(block: Dict[str, Any]) -> int:
@@ -7005,7 +4479,6 @@ def _sort_entry_blocks_for_document_order(
         if isinstance(block, dict):
             block['readingOrder'] = int(index)
             block.pop('_docOrderColumn', None)
-            block.pop('_docOrderBand', None)
     return ordered
 
 
@@ -7202,7 +4675,7 @@ def _repair_appendix_form_visual_captions(entries: List[Dict[str, Any]]) -> None
             block['caption'] = title
 
 
-def _detect_pdf_heading(line: str) -> Optional[Tuple[str, str, str]]:
+def _detect_pdf_heading(line: str) -> Optional[tuple]:
     t = _strip_pdf_page_prefix(line)
     if not t:
         return None
@@ -7292,22 +4765,6 @@ def _dedupe_preserve_lines(lines: List[str]) -> List[str]:
     return out
 
 
-def _is_pdf_page_marker_text(text: str) -> bool:
-    raw = str(text or '').strip()
-    compact = re.sub(r'\s+', '', raw)
-    if not compact:
-        return False
-    # Page markers like "·7·" / "·8·".
-    if re.fullmatch(r'[·•∙⋅・]\d{1,4}[·•∙⋅・]', compact):
-        return True
-    if re.fullmatch(r'[-—–_]*\d{1,4}[-—–_]*', compact):
-        # Avoid classifying short list markers like "1" / "2" / "48" as page markers.
-        if re.fullmatch(r'\d{1,2}', compact):
-            return False
-        return True
-    if re.fullmatch(r'第\d{1,4}页', compact):
-        return True
-    return False
 
 
 def _line_starts_new_pdf_paragraph(text: str) -> bool:
@@ -7483,7 +4940,7 @@ def _resolve_figure_body_subsection_label(
     body_text: str,
     *,
     recent_heading: str = '',
-    prior_segments: Optional[List[str]] = None,
+    prior_segments: Optional[list] = None,
 ) -> str:
     raw = re.sub(r'\s+', ' ', str(body_text or '').strip())
     if not raw or not _FIGURE_SECTION_OPENER_INLINE_REF_RE.search(raw):
@@ -8005,7 +5462,7 @@ def _rebuild_entry_search_text(entry: Dict) -> str:
         text = _extract_pdf_block_text(block)
         if not text:
             continue
-        if _is_pdf_page_marker_text(text):
+        if is_pdf_page_marker_text(text):
             continue
         block_type = str(block.get('type') or '').strip().lower()
         semantic_role = str(block.get('semanticRole') or '').strip().lower()
@@ -8095,7 +5552,7 @@ def _rebuild_entry_search_text(entry: Dict) -> str:
     raw_text = str(entry.get('contentMarkdown') or '').strip()
     raw_lines = [str(line or '').strip() for line in raw_text.splitlines() if str(line or '').strip()]
     return '\n'.join(_collapse_soft_wrapped_pdf_lines(_dedupe_preserve_lines([
-        line for line in raw_lines if not _is_likely_pdf_callout_or_annotation(line)
+        line for line in raw_lines if not is_likely_pdf_callout_or_annotation(line)
     ])))
 
 
@@ -8163,9 +5620,9 @@ def _block_contributes_to_pdf_entry_semantic_text(block: Dict[str, Any]) -> bool
     payload = _extract_pdf_block_text(block)
     if not payload:
         return False
-    if _is_pdf_page_marker_text(payload):
+    if is_pdf_page_marker_text(payload):
         return False
-    if _is_likely_pdf_callout_or_annotation(payload):
+    if is_likely_pdf_callout_or_annotation(payload):
         return False
     return True
 
@@ -8205,7 +5662,7 @@ def _block_is_cross_page_body_continuation(
     compact = re.sub(r'\s+', '', text)
     if not compact:
         return False
-    if _looks_like_pdf_attached_numbered_body_item(text):
+    if looks_like_pdf_attached_numbered_body_item(text):
         return False
     if _is_orphan_page_boundary_prefix(text):
         return False
@@ -8262,7 +5719,7 @@ def _block_is_page_boundary_continuation_fragment(
     compact = re.sub(r'\s+', '', str(text or '').strip())
     if not compact:
         return False
-    if _looks_like_pdf_attached_numbered_body_item(text):
+    if looks_like_pdf_attached_numbered_body_item(text):
         return False
     if re.match(r'^答\s*[：:]', compact):
         return True
@@ -8355,7 +5812,7 @@ def _leading_page_boundary_continuation_block_indexes(
         if anchor_page > 0 and block_page > anchor_page + 1:
             break
         text = _extract_pdf_block_text(block)
-        if not text or _is_pdf_page_marker_text(text):
+        if not text or is_pdf_page_marker_text(text):
             if prefix_indexes:
                 break
             continue
@@ -8399,7 +5856,7 @@ def _last_semantic_body_text(blocks: List[Dict[str, Any]]) -> str:
         if _block_role(block) != 'body':
             continue
         text = _extract_pdf_block_text(block)
-        if text and not _is_pdf_page_marker_text(text):
+        if text and not is_pdf_page_marker_text(text):
             return text
     return ''
 
@@ -8487,7 +5944,7 @@ def _filter_entry_noise_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, A
         if not isinstance(block, dict):
             continue
         text = _extract_pdf_block_text(block)
-        if text and _is_pdf_page_marker_text(text):
+        if text and is_pdf_page_marker_text(text):
             continue
         out.append(block)
     return out
@@ -9062,7 +6519,7 @@ def _pdf_heading_signal_score(
         if height >= 20:
             score += 1
 
-    if _is_likely_pdf_callout_or_annotation(text):
+    if is_likely_pdf_callout_or_annotation(text):
         score -= 6
     return score
 
@@ -9104,7 +6561,7 @@ def _iter_structured_heading_candidates(entry: Dict[str, Any]) -> List[Dict[str,
 
 
 def _allows_visual_appendix_heading(
-    detected: Optional[Tuple[str, str, str]],
+    detected: Optional[tuple],
     *,
     line: str,
     semantic_role: str,
@@ -9125,7 +6582,7 @@ def _allows_visual_appendix_heading(
 
 def _apply_structured_context(
     entries: List[Dict],
-    page_blue_headings: Optional[Dict[int, List[Dict[str, Any]]]] = None,
+    page_blue_headings: Optional[dict] = None,
 ) -> Dict[str, int]:
     current_unit = ''
     current_section = ''
@@ -9189,7 +6646,7 @@ def _apply_structured_context(
                 )
                 if not allow_visual_appendix and (
                     semantic_role in {'figure_callout', 'caption', 'legend', 'ocr_annotation'}
-                    or _is_likely_pdf_callout_or_annotation(line)
+                    or is_likely_pdf_callout_or_annotation(line)
                 ):
                     audit['headingCandidatesRejectedFigureScope'] += 1
                     continue
@@ -9309,26 +6766,6 @@ def _inject_internal_figure_links(text: str, blocks: List[Dict[str, Any]]) -> st
     return ref_pattern.sub(replacer, text)
 
 
-def _build_global_visual_index(entries: List[Dict]) -> Dict[str, str]:
-    """Map Figure/Table labels (e.g. '图 1-1') to block IDs."""
-    index = {}
-    for entry in entries:
-        for block in entry.get('blocks', []):
-            typ = str(block.get('type') or '').lower()
-            if typ in ('figure', 'table', 'image'):
-                caption = str(block.get('caption') or '').strip()
-                if not caption:
-                    continue
-
-                # Extract primary label like '图 1-1' or '表 2.2'
-                label = _extract_primary_visual_label(caption, 'table' if typ == 'table' else 'figure')
-                if label:
-                    block_id = block.get('id')
-                    if block_id:
-                        index[label] = block_id
-    return index
-
-
 def _build_global_toc_index(entries: List[Dict]) -> Dict[str, str]:
     """Map chapter/section/clause identifiers to entryIds."""
     index = {}
@@ -9363,31 +6800,16 @@ def _build_global_toc_index(entries: List[Dict]) -> Dict[str, str]:
 def _inject_all_cross_references(entries: List[Dict]):
     """Inject internal links for both figures and clauses."""
     global_index = _build_global_toc_index(entries)
-    visual_index = _build_global_visual_index(entries)
 
     # regex for: 第 X.Y.Z 条, 第 X 章, 第 X 节, 第 X.Y 节
     clause_pattern = re.compile(r'([见详见]?(第\s*(\d+(\.\d+)*|[0-9一二三四五六七八九十百]+)\s*[章节条款]))')
-    # regex for: [见]图 X-Y, 表 X-Y
-    visual_pattern = re.compile(r'([见详见]?[图表]\s*(\d+[-—.]\d+|\d+))')
 
     for entry in entries:
         text = str(entry.get('contentMarkdown') or '')
+        blocks = entry.get('blocks', [])
 
-        # 1. Figures/Tables (global)
-        def visual_replacer(match):
-            full_match = match.group(1)
-            label = match.group(2)
-
-            # Reconstruct full label (e.g. '图 1-1')
-            kind = '表' if '表' in full_match else '图'
-            full_label = f"{kind} {label}"
-
-            target_id = visual_index.get(full_label)
-            if target_id:
-                return f"[{full_match}](#{target_id})"
-            return full_match
-
-        text = visual_pattern.sub(visual_replacer, text)
+        # 1. Figures/Tables (local/contextual)
+        text = _inject_internal_figure_links(text, blocks)
 
         # 2. Clauses/Sections (global)
         def clause_replacer(match):
@@ -9436,83 +6858,6 @@ def _refresh_normalized_entry_text_fields(entry: Dict[str, Any]) -> None:
     entry['retrievalHints'] = retrieval_hints
 
 
-def _stich_cross_page_tables(entries: List[Dict]) -> List[Dict]:
-    """Merge tables that are split across page boundaries (often marked with '续表')."""
-    if not isinstance(entries, list) or len(entries) < 2:
-        return entries
-
-    out: List[Dict] = []
-    for entry in entries:
-        if not out:
-            out.append(entry)
-            continue
-
-        prev = out[-1]
-        curr = entry
-
-        # Check if previous entry ends with a table and current starts with a table
-        prev_blocks = prev.get('blocks', [])
-        curr_blocks = curr.get('blocks', [])
-
-        if not prev_blocks or not curr_blocks:
-            out.append(entry)
-            continue
-
-        p_last = prev_blocks[-1]
-        c_first = curr_blocks[0]
-
-        if p_last.get('type') == 'table' and c_first.get('type') == 'table':
-            # Potential match. Check column counts.
-            p_cells = p_last.get('table_cells', [])
-            c_cells = c_first.get('table_cells', [])
-
-            p_cols = max((c.get('col', 0) + c.get('colSpan', 1) for c in p_cells), default=0)
-            c_cols = max((c.get('col', 0) + c.get('colSpan', 1) for c in c_cells), default=0)
-
-            # If column counts match, and it's a consecutive page, merge.
-            p_page = prev.get('pageNumber', 0)
-            c_page = curr.get('pageNumber', 0)
-
-            # Heuristic: check for "续表" in the text near the second table
-            has_cont_marker = False
-            first_cell_text = str(c_cells[0].get('text', '')).strip() if c_cells else ''
-            if "续表" in first_cell_text or "续" in first_cell_text:
-                has_cont_marker = True
-
-            if p_cols > 0 and p_cols == c_cols and c_page == p_page + 1:
-                # Merge current table into previous table
-                p_rows = max((c.get('row', 0) + c.get('rowSpan', 1) for c in p_cells), default=0)
-
-                # Offset row indices for the second table's cells
-                for cell in c_cells:
-                    cell['row'] += p_rows
-                    p_cells.append(cell)
-
-                # Update previous table
-                p_last['table_cells'] = p_cells
-                # If the second table was the ONLY block in current, we might want to merge the entry entirely.
-                # For now, just remove the stitched table block from current.
-                curr_blocks.pop(0)
-                if not curr_blocks:
-                    # Current entry is now empty, skip adding it
-                    continue
-
-        out.append(entry)
-    return out
-
-
-def _ensure_stable_block_ids(blocks: List[Dict], page_num: int):
-    """Ensure every block has a stable, content-hashed ID."""
-    for i, b in enumerate(blocks):
-        if not b.get('id'):
-            # Build hash based on type, content and bbox
-            content = str(b.get('text') or b.get('code') or b.get('imageUri') or b.get('src') or '')
-            bbox = b.get('bbox')
-            bbox_str = str(bbox) if bbox else str(i)
-            b_hash = hashlib.sha1(f"auto|{page_num}|{b.get('type')}|{content[:128]}|{bbox_str}".encode('utf-8')).hexdigest()[:12]
-            b['id'] = f"b_auto_{b_hash}"
-
-
 def _normalize_entries_for_kb(entries: List[Dict]) -> List[Dict]:
     """Normalize entries into the canonical fields used by knowledge_base.json."""
     out: List[Dict] = []
@@ -9537,18 +6882,15 @@ def _normalize_entries_for_kb(entries: List[Dict]) -> List[Dict]:
         ne['entryId'] = str(ne.get('entryId') or f'entry_{idx:04d}')
         ne['jobTitle'] = str(ne.get('jobTitle') or f'条目{idx}')
         try:
-            page_num = int(ne.get('pageNumber') or 1)
+            ne['pageNumber'] = int(ne.get('pageNumber') or 1)
         except Exception:
-            page_num = 1
-        ne['pageNumber'] = page_num
+            ne['pageNumber'] = 1
         ne['_styleDetectionLines'] = _entry_text_lines_for_style_detection(ne)
         blocks = ne.get('blocks')
         ne['blocks'] = _normalize_pdf_entry_blocks(blocks if isinstance(blocks, list) else [])
         ne['blocks'] = _filter_standalone_part_label_blocks(ne['blocks'])
         ne['blocks'] = _canonicalize_inline_headings_in_blocks(ne['blocks'])
         ne['blocks'] = _sort_entry_blocks_for_document_order(ne['blocks'], ne)
-
-        _ensure_stable_block_ids(ne['blocks'], page_num)
 
         # Backward-compatible schema evolution: keep legacy fields unchanged,
         # append additive metadata for better retrieval/classification.
@@ -9572,10 +6914,6 @@ def _normalize_entries_for_kb(entries: List[Dict]) -> List[Dict]:
         _refresh_normalized_entry_text_fields(ne)
         out.append(ne)
     out = _repartition_blocks_by_page_number(_merge_page_boundary_numbered_continuations(out))
-
-    # NEW: Stitch cross-page tables
-    out = _stich_cross_page_tables(out)
-
     for entry in out:
         _refresh_normalized_entry_text_fields(entry)
     _repair_page_boundary_visual_captions(out)
@@ -9639,16 +6977,6 @@ def _count_images_in_entries(entries: List[Dict]) -> int:
     return count
 
 
-def _extract_pdf_page_sizes(pdf_path: str) -> Dict[int, List[float]]:
-    """Extract logical page sizes (points) for all pages."""
-    try:
-        import fitz
-        with fitz.open(pdf_path) as doc:
-            return {i + 1: [float(page.rect.width), float(page.rect.height)] for i, page in enumerate(doc)}
-    except Exception:
-        return {}
-
-
 def _build_output_payload(
     *,
     entries: List[Dict],
@@ -9679,7 +7007,6 @@ def _build_output_payload(
             'buildTool': 'pdf_to_base64_kb.py',
             'renderDpi': 300,
             'coordinateUnit': 'pt', # PDF points (1/72 inch)
-            'pageSizes': _extract_pdf_page_sizes(pdf_path),
         },
         'entries': normalized_entries,
     }
@@ -9723,7 +7050,7 @@ def _collect_semantic_audit(entries: List[Dict]) -> Dict[str, int]:
         job_title = str(entry.get('jobTitle') or '').strip()
         parts = [part.strip() for part in job_title.split('/') if part.strip()]
         leaf = parts[-1] if parts else ''
-        if leaf and _is_likely_pdf_callout_or_annotation(leaf):
+        if leaf and is_likely_pdf_callout_or_annotation(leaf):
             audit['entriesWithFigureScopeTitles'] += 1
             audit['entriesWithWeakLeafTitle'] += 1
         blocks = entry.get('blocks')
@@ -9784,7 +7111,7 @@ def _cleanup_non_visual_assets(assets_dir: str, entries: List[Dict]) -> None:
     
 
 
-def _paddle_result_to_lines(result, repeated_watermark_candidates: Optional[Set[str]] = None) -> List[str]:
+def _paddle_result_to_lines(result, repeated_watermark_candidates: Optional[set] = None) -> List[str]:
     """Normalize common PaddleOCR return structures into list of text lines.
 
     This is defensive: Paddle may return nested lists/tuples or numpy-like
@@ -9834,7 +7161,7 @@ def _paddle_result_to_lines(result, repeated_watermark_candidates: Optional[Set[
     return _filter_repeated_watermark_lines(out, repeated_watermark_candidates)
 
 
-def _paddle_result_to_text_blocks(result, repeated_watermark_candidates: Optional[Set[str]] = None) -> List[Dict]:
+def _paddle_result_to_text_blocks(result, repeated_watermark_candidates: Optional[set] = None) -> List[Dict]:
     if not result or not isinstance(result, list):
         return []
     try:
@@ -9882,7 +7209,7 @@ def _paddle_result_to_text_blocks(result, repeated_watermark_candidates: Optiona
 def _ocr_image_bytes_with_structure(
     image_bytes: bytes,
     ocr_engine: str = 'auto',
-    repeated_watermark_candidates: Optional[Set[str]] = None,
+    repeated_watermark_candidates: Optional[set] = None,
 ) -> Tuple[str, List[Dict]]:
     if ocr_engine == 'auto':
         if _HAS_PADDLE:
@@ -9926,7 +7253,7 @@ def _ocr_image_bytes_with_structure(
 def _ocr_image_bytes(
     image_bytes: bytes,
     ocr_engine: str = 'auto',
-    repeated_watermark_candidates: Optional[Set[str]] = None,
+    repeated_watermark_candidates: Optional[set] = None,
 ) -> str:
     """Run OCR on bytes and return recognized text (joined).
 
@@ -10073,7 +7400,7 @@ def _ocr_image_bytes(
     return ''
 
 
-def _text_to_table_rows(text: str) -> Optional[List[List[str]]]:
+def _text_to_table_rows(text: str) -> Optional[list]:
     if not text:
         return None
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -10579,18 +7906,14 @@ def build_kb_from_pdf(
                         if text_region and re.search(r'(?<!\d)\d{1,2}\.\d{1,2}\.\d{1,3}(?!\d)', text_region):
                             try:
                                 x, y, w, h = lb.get('bbox', (0, 0, 0, 0))
-                                bbox_norm = _xywh_to_bbox_dict(int(x), int(y), int(w), int(h))
-                                bbox_str = f"{bbox_norm['left']},{bbox_norm['top']},{bbox_norm['right']},{bbox_norm['bottom']}"
-                                block_id = hashlib.sha1(f"pdf_layout_text|{page_num}|{text_region[:256]}|{bbox_str}".encode('utf-8')).hexdigest()[:12]
-
                                 text_region_block = {
-                                    'id': f'b_layout_text_{block_id}',
+                                    'id': f'b_layout_text_{page_num}_{len(blocks) + 1}',
                                     'type': 'code',
                                     'language': 'markdown',
                                     'code': text_region,
                                     'pageNumber': int(page_num),
                                     'semanticRole': 'body',
-                                    'bbox': bbox_norm,
+                                    'bbox': _xywh_to_bbox_dict(int(x), int(y), int(w), int(h)),
                                     'readingOrder': int(10000 + len(blocks) + 1),
                                     'structureSource': 'layout_text_region',
                                 }
@@ -11322,19 +8645,10 @@ def build_kb_from_pdf(
                                         continue
 
                                     supp_typ = str(cand.get('type') or 'figure').lower()
-                                    block_hash = hashlib.sha1(f"{supp_typ}|{page_num}|{supp_uri}".encode('utf-8')).hexdigest()[:12]
-
                                     if supp_typ == 'table':
                                         supp_text = str(cand.get('contentMarkdown') or '')
                                         table_rows = cand.get('table_rows')
-                                        supp_block = {
-                                            'id': f'b_table_{block_hash}',
-                                            'type': 'table',
-                                            'imageUri': supp_uri,
-                                            'caption': f'Table {crop_index}',
-                                            'contentMarkdown': supp_text,
-                                            'semanticRole': 'table'
-                                        }
+                                        supp_block = {'type': 'table', 'imageUri': supp_uri, 'caption': f'Table {crop_index}', 'contentMarkdown': supp_text, 'semanticRole': 'table'}
                                         if table_rows:
                                             supp_block['table_rows'] = table_rows
                                             try:
@@ -11350,13 +8664,7 @@ def build_kb_from_pdf(
                                             ocr_engine=ocr_engine,
                                             repeated_watermark_candidates=repeated_watermark_candidates,
                                         )
-                                        supp_block = {
-                                            'id': f'b_fig_{block_hash}',
-                                            'type': 'figure',
-                                            'imageUri': supp_uri,
-                                            'caption': embedded_caption or f'Figure {crop_index}',
-                                            'semanticRole': 'figure'
-                                        }
+                                        supp_block = {'type': 'figure', 'imageUri': supp_uri, 'caption': embedded_caption or f'Figure {crop_index}', 'semanticRole': 'figure'}
 
                                     blocks.append(supp_block)
                                     saved_crop_boxes.append((fx, fy, fw, fh))

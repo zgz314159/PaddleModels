@@ -1,0 +1,40 @@
+[project]
+name = "paddle_models"
+version = "0.2.0"
+description = "Industrial PDF/DOCX to Knowledge Base extraction pipeline"
+authors = [
+    { name = "PaddleModels Maintainer" }
+]
+dependencies = [
+    "PyMuPDF>=1.23.0",
+    "Pillow>=10.0.0",
+    "jsonschema>=4.18.0",
+    "requests>=2.31.0",
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "python-docx>=1.0.0",
+    "paddleocr>=2.7.0",
+    "paddlepaddle>=2.5.0",
+    "pytesseract>=0.3.10",
+]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.7.0",
+    "isort>=5.12.0",
+    "mypy>=1.5.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.isort]
+profile = "black"
+line_length = 100

@@ -20,6 +20,8 @@ apikey.txt
 .idea/
 .vscode/
 .history/
+*.iml
+*.swp
 
 # Data & Models
 samples/
@@ -29,6 +31,44 @@ models/weights/
 *.json
 !contracts/*.json
 !src/paddle_models/contracts/*.json
+!pyproject.toml
+
+# Large Binary & Model Files
+*.gguf
+*.onnx
+*.onnx_data
+*.pth
+*.pt
+*.mlmodel
+*.h5
+*.tflite
+*.bin
+
+# Build & Cache
+build/
+dist/
+.cache/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
 
 # Artifacts
 .artifacts/
+
+# PowerAi specific sync
+*.db
+*.db-shm
+*.db-wal
+*.log
+/build/tmp/
+
+# Agent metadata & generated app output (safe-checkpoint governance)
+.commandcode/
+/app/
+
+# Preserve authored contract schema and test fixtures despite the global *.json rule
+!docs/kb_v2_schema.json
+!tests/fixtures/
+!tests/fixtures/**
