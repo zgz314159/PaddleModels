@@ -618,6 +618,7 @@ class TestTableDiffGeometryStats(unittest.TestCase):
 
         cells = [{"row": 0, "col": 0, "rowSpan": 1, "colSpan": 1, "text": "a"}]
         # 6x4 grid, 1 physical (incomplete sample) — just check fields
+        # NOTE: integer rows/cols + table_rows = historical/transition shape (compat), not current v2.
         stats = _table_geometry_stats(
             {"table_rows": [["a", "", "", ""]], "cells": cells, "rows": 6, "cols": 4},
             side="v2",
@@ -640,7 +641,7 @@ class TestTableDiffGeometryStats(unittest.TestCase):
         self.assertEqual(stats["physical_cells"], 4)
         self.assertEqual(stats["grid_slots"], 4)
 
-    def test_counting_note_in_report(self):
+    def test_counting_note_in_report_legacy_numeric_shape(self):
         from pipeline.compatibility.table_diff import build_table_diff_report
 
         leg = {"entries": [{"entryId": "e", "blocks": [{
@@ -648,6 +649,7 @@ class TestTableDiffGeometryStats(unittest.TestCase):
             "table_rows": [["a", "b", "c", "d"]] * 6,
             "bbox": {"left": 0, "top": 0, "right": 100, "bottom": 50},
         }]}]}
+        # Historical/transition v2 shape (integer rows/cols + table_rows) — kept for compat only.
         v2 = {"entries": [{"entryId": "e", "blocks": [{
             "type": "table", "pageNumber": 29,
             "rows": 6, "cols": 4,
@@ -758,6 +760,112 @@ class TestTableRowsContractFix(unittest.TestCase):
         expected = table_rows_to_markdown(tb["rows"])
         kb = SemanticProjector("d", strategy="heading").project(self._ir(self._SPANNED_TABLE))
         self.assertIn(expected, kb["entries"][0]["contentMarkdown"])
+
+
+class TestTableRowsConsumerClosure(unittest.TestCase):
+    """Closure: v2 table `rows` (2D) consumers — table_diff + CLI metrics."""
+
+    _MERGED = [
+        {"row": 0, "col": 0, "text": "H1"},
+        {"row": 0, "col": 1, "text": "H2"},
+        {"row": 1, "col": 0, "text": "merged-span", "rowSpan": 2, "colSpan": 1},
+        {"row": 1, "col": 1, "text": "b1"},
+        {"row": 2, "col": 1, "text": "b2"},
+    ]
+
+    def _project(self):
+        ir = CanonicalIR(document_id="d", sha256="0" * 64)
+        page = DocPage(page_number=1, width=246.0, height=360.0, method="native")
+        page.blocks.append(DocBlock(id="p1_tbl_struct", type="table", text="", bbox=BBox(22.6, 206.5, 198.2, 84.9),
+                                    page_number=1, reading_order=1,
+                                    metadata={"cells": self._MERGED, "structureStatus": "structured", "imageUri": "shots/s.png"}))
+        page.blocks.append(DocBlock(id="p1_tbl_image", type="table", text="", bbox=BBox(10.0, 10.0, 100.0, 40.0),
+                                    page_number=1, reading_order=2,
+                                    metadata={"cells": [], "structureStatus": "image_only", "imageUri": "shots/i.png"}))
+        ir.pages.append(page)
+        return SemanticProjector("d", strategy="heading").project(ir)
+
+    def _metrics(self, blocks):
+        return kb_metrics_from_obj(
+            {
+                "fileMetadata": {"schemaVersion": "2.0", "fileId": "d", "docSha256": "0" * 64},
+                "entries": [{"entryId": "e", "blocks": blocks}],
+            },
+            include_figure_association=False,
+        )
+
+    def test_1_real_projection_table_diff_no_exception(self):
+        from pipeline.compatibility.table_diff import build_table_diff_report
+        report = build_table_diff_report({"entries": []}, self._project())
+        self.assertEqual(report["v2_table_count"], 2)
+
+    def test_2_table_diff_geometry_and_markdown_preview(self):
+        from pipeline.compatibility.table_diff import build_table_diff_report, collect_v2_tables
+        kb = self._project()
+        by_id = {t["id"]: t for t in collect_v2_tables(kb)}
+        st = by_id["p1_tbl_struct"]["geometry"]
+        self.assertEqual((st["logical_rows"], st["logical_cols"], st["grid_slots"]), (3, 2, 6))
+        self.assertEqual(st["physical_cells"], 5)
+        self.assertEqual(st["spanned_cells"], 1)
+        self.assertTrue(st["span_data_available"])
+        io = by_id["p1_tbl_image"]["geometry"]
+        self.assertEqual((io["logical_rows"], io["physical_cells"]), (0, 0))
+        self.assertEqual(by_id["p1_tbl_image"]["table_rows"], [])
+        leg = {"entries": [{"entryId": "e", "blocks": [{
+            "type": "table", "id": "L", "pageNumber": 1,
+            "bbox": {"left": 22, "top": 206, "right": 221, "bottom": 291},
+            "table_rows": [["H1", "H2"], ["merged-span", "b1"], ["", "b2"]],
+        }]}]}
+        comp = next(c for c in build_table_diff_report(leg, kb)["comparisons"] if "v2_markdown_preview" in c)
+        self.assertIn("H1", comp["v2_markdown_preview"])
+
+    def test_3_metrics_canonical_rows_and_cells_no_double_count(self):
+        m = self._metrics([{"type": "table", "structureStatus": "structured",
+                            "rows": [["a", ""], ["b", "c"]],
+                            "cells": [{"row": 0, "col": 0, "text": "a"}] * 4}])
+        self.assertEqual(m["tables_structured"], 1)
+        self.assertEqual(m["table_cells"], 3)  # grid non-empty only; cells not double-counted
+
+    def test_4_metrics_canonical_rows_without_cells(self):
+        m = self._metrics([{"type": "table", "structureStatus": "structured", "rows": [["x", "y"], ["z", ""]]}])
+        self.assertEqual(m["table_cells"], 3)
+
+    def test_5_image_only_empty_rows_preserved(self):
+        m = self._metrics([{"type": "table", "structureStatus": "image_only", "rows": [], "imageUri": "shots/i.png"}])
+        self.assertEqual(m["tables_image_only"], 1)
+        self.assertEqual(m["tables_structured"], 0)
+        self.assertEqual(m["table_assets_missing"], 0)
+
+    def test_6_legacy_table_rows_still_readable(self):
+        m = self._metrics([{"type": "table", "table_rows": [["a", "b"], ["c", ""]]}])
+        self.assertEqual(m["tables_structured"], 1)
+        self.assertEqual(m["table_cells"], 3)
+
+    def test_7_legacy_integer_rows_cols_table_rows_no_error(self):
+        from pipeline.compatibility.table_diff import collect_v2_tables
+        kb = {"entries": [{"entryId": "e", "blocks": [{
+            "type": "table", "rows": 6, "cols": 4,
+            "table_rows": [[""] * 4 for _ in range(6)]}]}]}
+        st = collect_v2_tables(kb)[0]["geometry"]
+        self.assertEqual((st["logical_rows"], st["logical_cols"], st["grid_slots"]), (6, 4, 24))
+
+    def test_8_empty_rows_list_wins_over_stale_table_rows(self):
+        from pipeline.compatibility.table_diff import collect_v2_tables
+        block = {"type": "table", "rows": [], "table_rows": [["a", "b"]],
+                 "imageUri": "shots/i.png", "structureStatus": "image_only"}
+        m = self._metrics([dict(block)])
+        self.assertEqual(m["tables_image_only"], 1)
+        self.assertEqual(m["table_cells"], 0)  # canonical empty rows used; NOT the stale table_rows
+        st = collect_v2_tables({"entries": [{"entryId": "e", "blocks": [block]}]})[0]["geometry"]
+        self.assertEqual(st["logical_rows"], 0)
+
+    def test_9_new_production_output_has_no_legacy_fields(self):
+        for entry in self._project()["entries"]:
+            for b in entry["blocks"]:
+                if b.get("type") == "table":
+                    self.assertNotIn("table_rows", b)
+                    self.assertNotIn("cols", b)
+                    self.assertIsInstance(b.get("rows"), list)
 
 
 if __name__ == "__main__":

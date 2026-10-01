@@ -223,13 +223,27 @@ def _is_nonempty_entry(entry: Dict[str, Any]) -> bool:
     return bool(normalize_text(_entry_normalized_text(entry)))
 
 
+def _canonical_table_grid(block: Dict[str, Any]) -> List[List[Any]]:
+    """Canonical 2D grid for a table block.
+
+    Prefer a list-valued `rows` (the v2 contract, including an empty list) over the
+    legacy `table_rows` alias; a list-valued `rows` is a grid, never a row count.
+    """
+    rows = block.get("rows")
+    if isinstance(rows, list):
+        return rows
+    legacy = block.get("table_rows")
+    if isinstance(legacy, list):
+        return legacy
+    return []
+
+
 def _classify_table_status(block: Dict[str, Any]) -> str:
     """Legacy-compatible structureStatus inference (no fabricated cells)."""
     status = block.get("structureStatus")
     if status in ("structured", "image_only"):
         return status
-    rows = block.get("table_rows") or []
-    if rows:
+    if _canonical_table_grid(block):
         return "structured"
     # No rows: image_only only if a visual asset is present.
     if block.get("imageUri") or block.get("src"):
@@ -295,14 +309,17 @@ def kb_metrics_from_obj(
                 st = _classify_table_status(block)
                 if st == "structured":
                     num_tables_structured += 1
-                    rows = block.get("table_rows") or []
-                    # Count non-empty cells from dense rows when present.
-                    for row in rows:
-                        table_cells += sum(1 for cell in row if str(cell or "").strip())
-                    # Also honor explicit cells list if provided by exporter.
-                    cells = block.get("cells")
-                    if isinstance(cells, list) and cells and not rows:
-                        table_cells += len(cells)
+                    grid = _canonical_table_grid(block)
+                    if grid:
+                        # Count non-empty cells from the canonical dense grid.
+                        for row in grid:
+                            if isinstance(row, list):
+                                table_cells += sum(1 for cell in row if str(cell or "").strip())
+                    else:
+                        # No grid: fall back to the explicit physical cells list.
+                        cells = block.get("cells")
+                        if isinstance(cells, list) and cells:
+                            table_cells += len(cells)
                 else:
                     num_tables_image_only += 1
                 uri = block.get("imageUri") or block.get("src") or ""
