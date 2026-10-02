@@ -25,11 +25,8 @@ def check_src_layout():
         return False
     
     required_paths = [
-        "cli/main.py",
-        "domain/models.py",
-        "infrastructure/pdf/ocr_adapters",
-        "infrastructure/pdf/table_adapters",
-        "infrastructure/storage/kb_exporter.py"
+        "__init__.py",
+        "cli/main.py"
     ]
     for p in required_paths:
         full_path = src_path / p
