@@ -34,9 +34,18 @@ def classify_text_projection(semantic_role: Optional[str]) -> str:
 class SemanticProjector:
     """Projects CanonicalIR into Android-compatible Knowledge Base entries."""
 
-    def __init__(self, document_id: str, strategy: str = "heading"):
+    def __init__(
+        self,
+        document_id: str,
+        strategy: str = "heading",
+        pdf_source_name: Optional[str] = None,
+    ):
         self.document_id = document_id
         self.strategy = strategy
+        # Original PDF file name. When set (and the IR carries an input sha256),
+        # the KB declares a PowerAi-parseable "pdf:{sha256}::{name}" source so the
+        # produced KB needs no post-edit to link the original PDF.
+        self.pdf_source_name = pdf_source_name
 
     def project(self, ir: CanonicalIR) -> Dict[str, Any]:
         entries: List[Dict[str, Any]] = []
@@ -330,11 +339,21 @@ class SemanticProjector:
                 if uri:
                     unique_images.add(uri)
 
+        if self.pdf_source_name and ir.sha256:
+            # PDF input: declare the original PDF link (sha256 of the input bytes)
+            # so the emitted KB matches the source PDF without post-processing.
+            file_name = self.pdf_source_name
+            source = f"pdf:{ir.sha256}::{self.pdf_source_name}"
+        else:
+            # Non-PDF / legacy / no sha: keep the historical assets/kb contract.
+            file_name = "knowledge_base.json"
+            source = f"assets/kb/{self.document_id}"
+
         metadata = {
             "schemaVersion": "2.0",
             "fileId": self.document_id,
-            "fileName": "knowledge_base.json",
-            "source": f"assets/kb/{self.document_id}",
+            "fileName": file_name,
+            "source": source,
             "importTimestamp": None,
             "entriesCount": len(entries),
             "imagesCount": len(unique_images),

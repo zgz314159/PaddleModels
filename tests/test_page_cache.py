@@ -359,7 +359,7 @@ class _FakeLayout:
 
 
 class _FakeProjector:
-    def __init__(self, document_id, strategy=None):
+    def __init__(self, document_id, strategy=None, pdf_source_name=None):
         pass
 
     def project(self, doc_ir):

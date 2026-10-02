@@ -395,7 +395,12 @@ def run_v2(ctx: RunContext, page_range_str: Optional[str] = None):
     ctx.profile.parameters["figureReferenceReport"] = str(fr_path)
 
     # Semantic Projection
-    projector = SemanticProjector(ctx.input_path.stem, strategy=ctx.profile.grouping_strategy)
+    is_pdf_input = ctx.input_path.suffix.lower() == ".pdf"
+    projector = SemanticProjector(
+        ctx.input_path.stem,
+        strategy=ctx.profile.grouping_strategy,
+        pdf_source_name=(ctx.input_path.name if is_pdf_input else None),
+    )
     kb_final = projector.project(doc_ir)
     
     # Save outputs
