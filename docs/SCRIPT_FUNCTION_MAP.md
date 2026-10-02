@@ -18,6 +18,8 @@ Mapping of core functions to their implementation files.
 | `page_has_structural_visual_signal` | [vision_utils.py](file:///C:/Users/zgz31/Desktop/PaddleModels/imaging/vision_utils.py) | Implementation | Structural line detection |
 | `collect_repeated_watermark_candidates` | [watermark_utils.py](file:///C:/Users/zgz31/Desktop/PaddleModels/imaging/watermark_utils.py) | Implementation | Watermark identification |
 | `run_v2` | [v2_runner.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/v2_runner.py) | Entry | Main v2 pipeline execution loop |
+| `route_page` | [page_router.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/page_router.py) | Implementation | Per-page native/ocr routing decision (never hybrid); deterministic ocr fallback |
+| `probe_page_native_chars` | [native_adapter.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/extraction_adapters/native_adapter.py) | Implementation | Cheap per-page native text probe (non-whitespace char count) used only for routing |
 | `extract_page` | [native_adapter.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/extraction_adapters/native_adapter.py) | Implementation | High-precision native PDF extraction |
 | `detect_blocks` | [layout_adapter.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/extraction_adapters/layout_adapter.py) | Implementation | Visual block detection (tables/figures) |
 | `project` | [semantic_projector.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/semantic_projector.py) | Implementation | Canonical IR to Knowledge Base projection |
