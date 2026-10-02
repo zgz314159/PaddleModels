@@ -31,3 +31,5 @@ Mapping of core functions to their implementation files.
 | `PageCache.load` | [page_cache.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/page_cache.py) | Implementation | Validate a page-cache metadata envelope; return DocPage on a full match, else a safe miss |
 | `PageCache.store` | [page_cache.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/page_cache.py) | Implementation | Atomically write the fingerprinted page-cache envelope (temp file + os.replace) |
 | `page_ir_from_dict` | [page_cache.py](file:///C:/Users/zgz31/Desktop/PaddleModels/pipeline/page_cache.py) | Implementation | Reconstruct a DocPage from its plain-dict Canonical IR form |
+| `check_ir_schema` | [check_project.py](file:///C:/Users/zgz31/Desktop/PaddleModels/scripts/check_project.py) | Implementation | Validate the Canonical IR schema (contracts/knowledge-base.v2.schema.json) exists and is valid JSON |
+| `check_kb_schema` | [check_project.py](file:///C:/Users/zgz31/Desktop/PaddleModels/scripts/check_project.py) | Implementation | Validate the Android KB schema (contracts/knowledge_base_schema_v2.json) exists and is valid JSON |
