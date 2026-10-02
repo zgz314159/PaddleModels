@@ -22,12 +22,15 @@ Every entry now contains a `blocks` list. Android should prioritize rendering `b
 
 ## 3. Coordinate System
 
-All `bbox` objects use absolute coordinates in the `coordinateUnit` specified in metadata.
-They can be represented as an array `[x, y, w, h]` or an object. Array is preferred for V2 high-precision.
+Every block `bbox` is an object with absolute coordinates in the `coordinateUnit` declared in `fileMetadata` (normally `"pt"`):
 
 ```json
-"bbox": [100.0, 200.0, 300.0, 50.0]
+"bbox": { "left": 100.0, "top": 200.0, "right": 400.0, "bottom": 250.0, "width": 300.0, "height": 50.0 }
 ```
+
+`left`, `top`, `right`, `bottom` are required; `width` and `height` are optional. The authoritative definition lives in `contracts/knowledge_base_schema_v2.json`.
+
+The array form `[x, y, w, h]` is **not** a v2 production output — it is only a legacy compatibility input (see §5).
 Android's PDF viewer should map these to the PDF page view for highlighting.
 
 ## 4. Asset Handling
@@ -37,7 +40,19 @@ The `imageUri` field contains the relative path (e.g., `"shots/p5_v0.png"`).
 
 ## 5. Backward Compatibility
 
-For older Android versions that do not support v2 blocks:
-- `contentMarkdown` and `contentNormalized` are still populated.
-- `kind` is still used to signal if an entry is primarily a table.
+The v2 pipeline never emits the historical formats below. They are accepted only as **compatibility inputs** for older data:
+- An array `[x, y, w, h]` bbox (see §3) — legacy input; v2 output always writes the object form.
+- `table_rows` (2D array) — legacy alias for `rows`; v2 output writes only `rows`.
+- `contentMarkdown` and `contentNormalized` remain populated, and `kind` still signals when an entry is primarily a table, for older Android versions that do not render v2 blocks.
 - Legacy `imageUris` and `tableImageUri` are partially supported but deprecated.
+
+## 6. Authoritative Schemas
+
+Two different JSON contracts exist in this repository; do not mix them:
+
+| Contract | Authoritative schema | Artifact |
+|---|---|---|
+| Android knowledge base (this document) | `contracts/knowledge_base_schema_v2.json` | `knowledge_base.json` |
+| Canonical IR (internal; `{x, y, w, h}` bbox) | `contracts/knowledge-base.v2.schema.json` | `knowledge_base.v2.json` |
+
+`scripts/check_project.py` verifies that both schema files exist and are valid JSON.

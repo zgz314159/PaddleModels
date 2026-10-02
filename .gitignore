@@ -67,7 +67,6 @@ htmlcov/
 .commandcode/
 /app/
 
-# Preserve authored contract schema and test fixtures despite the global *.json rule
-!docs/kb_v2_schema.json
+# Preserve authored test fixtures despite the global *.json rule
 !tests/fixtures/
 !tests/fixtures/**
