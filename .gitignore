@@ -30,7 +30,6 @@ models/weights/
 *.docx
 *.json
 !contracts/*.json
-!src/paddle_models/contracts/*.json
 !pyproject.toml
 
 # Large Binary & Model Files
