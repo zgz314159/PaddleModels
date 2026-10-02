@@ -5,6 +5,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# BuildProfile fields that can change the extracted page IR. Only these are
+# folded into the page-cache fingerprint; identity/projection-only fields
+# (name, grouping_strategy) are intentionally excluded.
+PAGE_IR_CONFIG_FIELDS = (
+    "use_native_text",
+    "ocr_enabled",
+    "ocr_engine",
+    "layout_engine",
+    "gpu_enabled",
+    "figure_caption_ocr",
+)
+
+
 @dataclass
 class BuildProfile:
     """Configuration for a specific pipeline run."""
@@ -31,6 +44,14 @@ class BuildProfile:
             "grouping_strategy": self.grouping_strategy,
             "figure_caption_ocr": self.figure_caption_ocr
         }
+
+    def page_ir_cache_config(self) -> Dict:
+        """Stable, deterministic subset of this profile that affects page IR.
+
+        Used as one input of the page-cache fingerprint. Excludes run-specific
+        state and fields that only influence downstream projection.
+        """
+        return {name: getattr(self, name) for name in PAGE_IR_CONFIG_FIELDS}
 
 @dataclass
 class RunContext:

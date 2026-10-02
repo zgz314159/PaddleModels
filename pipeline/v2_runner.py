@@ -17,7 +17,8 @@ from pipeline.semantics.figure_text_association import associate_ir_figures
 from pipeline.semantic_projector import SemanticProjector
 from pipeline.canonical_ir import CanonicalIR
 from imaging.bbox_utils import bbox_overlap_ratio_xywh
-from pipeline.page_router import PageRouter
+from pipeline.page_router import DEFAULT_MIN_NATIVE_CHARS, PageRouter
+from pipeline.page_cache import PageCache
 
 try:
     import jsonschema
@@ -64,6 +65,16 @@ def run_v2(ctx: RunContext, page_range_str: Optional[str] = None):
     # Cache and Router
     cache_dir = ctx.get_cache_dir()
     router = PageRouter(ctx)
+    page_cache = PageCache(
+        cache_dir,
+        input_sha256=ctx.get_input_sha256(),
+        profile_config=ctx.profile.page_ir_cache_config(),
+        router_config={
+            "min_native_chars": getattr(
+                router, "min_native_chars", DEFAULT_MIN_NATIVE_CHARS
+            )
+        },
+    )
     
     # adapters
     native = router.native_adapter
@@ -100,84 +111,57 @@ def run_v2(ctx: RunContext, page_range_str: Optional[str] = None):
     print(f"Processing pages {start_page} to {end_page} of {total_pages}...")
     
     for p_num in range(start_page, end_page + 1):
-        # Cache check
-        page_cache_path = cache_dir / f"page_{p_num}.json"
-        if page_cache_path.exists():
-            with open(page_cache_path, "r", encoding="utf-8") as f:
-                page_ir_dict = json.load(f)
-                
-                # Reconstruct DocPage object from dict
-                from pipeline.canonical_ir import DocPage, DocBlock, BBox
-                blocks = []
-                for b in page_ir_dict.get('blocks', []):
-                    bb = b['bbox']
-                    blocks.append(DocBlock(
-                        id=b['id'],
-                        type=b['type'],
-                        text=b['text'],
-                        bbox=BBox(bb['x'], bb['y'], bb['w'], bb['h']),
-                        page_number=b['page_number'],
-                        reading_order=b['reading_order'],
-                        confidence=b.get('confidence', 1.0),
-                        source=b.get('source', 'unknown'),
-                        metadata=b.get('metadata', {})
-                    ))
-                
-                page_obj = DocPage(
-                    page_number=page_ir_dict['page_number'],
-                    width=page_ir_dict['width'],
-                    height=page_ir_dict['height'],
-                    blocks=blocks,
-                    rotation=page_ir_dict.get('rotation', 0),
-                    method=page_ir_dict.get('method', 'unknown')
-                )
-
-                # Cache stores IR only — rehydrate missing shot assets for this run dir.
-                try:
-                    missing_assets = [
-                        b for b in page_obj.blocks
-                        if b.type in ("table", "image", "figure")
-                        and isinstance(b.metadata.get("imageUri"), str)
-                        and b.metadata["imageUri"].startswith("shots/")
-                        and not (ctx.output_dir / b.metadata["imageUri"]).exists()
-                    ]
-                    if missing_assets:
-                        dpi_c = 144
-                        scale_c = 72.0 / dpi_c
-                        img_b = native.render_page(p_num, dpi=dpi_c)
-                        from PIL import Image as _Image
-                        import io as _io
-                        page_img_c = _Image.open(_io.BytesIO(img_b))
-                        pw, ph = page_img_c.size
-                        for b in missing_assets:
-                            try:
-                                x0 = max(0, int(b.bbox.x / scale_c))
-                                y0 = max(0, int(b.bbox.y / scale_c))
-                                x1 = min(pw, int((b.bbox.x + b.bbox.w) / scale_c))
-                                y1 = min(ph, int((b.bbox.y + b.bbox.h) / scale_c))
-                                if x1 <= x0 or y1 <= y0:
-                                    raise ValueError("invalid crop")
-                                cropped = page_img_c.crop((x0, y0, x1, y1))
-                                rel = b.metadata["imageUri"]
-                                out_p = ctx.output_dir / rel
-                                out_p.parent.mkdir(parents=True, exist_ok=True)
-                                cropped.save(out_p)
-                                if not out_p.exists() or out_p.stat().st_size <= 0:
-                                    raise ValueError("empty crop")
-                                b.metadata["assetWidth"] = int(cropped.size[0])
-                                b.metadata["assetHeight"] = int(cropped.size[1])
-                            except Exception as ae:
-                                print(f"[WARN] cache asset rehydrate failed {b.id}: {ae}")
-                                b.metadata.setdefault("cropWarnings", []).append(str(ae))
-                except Exception as re_hydrate_e:
-                    print(f"[WARN] cache asset pass failed page={p_num}: {re_hydrate_e}")
-
-                doc_ir.pages.append(page_obj)
-                print(f"Page {p_num}: Loaded from cache")
-                continue
-
+        # Route first so native and ocr pages get distinct cache identities.
         strategy = router.route_page(p_num)
         print(f"Page {p_num}: Strategy {strategy}")
+
+        # A hit requires schema, fingerprint, input SHA, page number and
+        # strategy to all match; any mismatch or corruption is a safe miss.
+        page_obj = page_cache.load(p_num, strategy)
+        if page_obj is not None:
+            # Cache stores IR only — rehydrate missing shot assets for this run dir.
+            try:
+                missing_assets = [
+                    b for b in page_obj.blocks
+                    if b.type in ("table", "image", "figure")
+                    and isinstance(b.metadata.get("imageUri"), str)
+                    and b.metadata["imageUri"].startswith("shots/")
+                    and not (ctx.output_dir / b.metadata["imageUri"]).exists()
+                ]
+                if missing_assets:
+                    dpi_c = 144
+                    scale_c = 72.0 / dpi_c
+                    img_b = native.render_page(p_num, dpi=dpi_c)
+                    from PIL import Image as _Image
+                    import io as _io
+                    page_img_c = _Image.open(_io.BytesIO(img_b))
+                    pw, ph = page_img_c.size
+                    for b in missing_assets:
+                        try:
+                            x0 = max(0, int(b.bbox.x / scale_c))
+                            y0 = max(0, int(b.bbox.y / scale_c))
+                            x1 = min(pw, int((b.bbox.x + b.bbox.w) / scale_c))
+                            y1 = min(ph, int((b.bbox.y + b.bbox.h) / scale_c))
+                            if x1 <= x0 or y1 <= y0:
+                                raise ValueError("invalid crop")
+                            cropped = page_img_c.crop((x0, y0, x1, y1))
+                            rel = b.metadata["imageUri"]
+                            out_p = ctx.output_dir / rel
+                            out_p.parent.mkdir(parents=True, exist_ok=True)
+                            cropped.save(out_p)
+                            if not out_p.exists() or out_p.stat().st_size <= 0:
+                                raise ValueError("empty crop")
+                            b.metadata["assetWidth"] = int(cropped.size[0])
+                            b.metadata["assetHeight"] = int(cropped.size[1])
+                        except Exception as ae:
+                            print(f"[WARN] cache asset rehydrate failed {b.id}: {ae}")
+                            b.metadata.setdefault("cropWarnings", []).append(str(ae))
+            except Exception as re_hydrate_e:
+                print(f"[WARN] cache asset pass failed page={p_num}: {re_hydrate_e}")
+
+            doc_ir.pages.append(page_obj)
+            print(f"Page {p_num}: Loaded from cache")
+            continue
 
         # Native extraction always as base if strategy allows
         page_ir = native.extract_page(p_num)
@@ -325,10 +309,8 @@ def run_v2(ctx: RunContext, page_range_str: Optional[str] = None):
             
         print(f"Page {p_num}: {len(page_ir.blocks)} blocks ({len(visual_blocks)} visual)")
         
-        # Save to cache
-        with open(page_cache_path, "w", encoding="utf-8") as f:
-            json.dump(page_ir.to_dict(), f, indent=2, ensure_ascii=False)
-            
+        # Save to cache (atomic, fingerprinted envelope)
+        page_cache.store(p_num, strategy, page_ir)
         doc_ir.pages.append(page_ir)
     
     router.close()
