@@ -1,11 +1,11 @@
-"""Architecture boundary guard: the active pipeline must not import parked code.
+"""Architecture boundary guard: the active pipeline must not import retired code.
 
 Read-only static analysis over source text. Standard library only (`ast`,
 `pathlib`, `unittest`) — no dependencies, no product imports, no cwd/installed-package
 assumptions. Files are located from this file's absolute position.
 
 The guard scans the active production scope and the test tree; it never scans the
-parked packages' own internal imports. Violations are reported with file, line and
+retired packages' own internal imports. Violations are reported with file, line and
 module. Counts/LOC/absolute-import totals are intentionally NOT asserted so unrelated
 new files cannot make this guard flaky.
 """
@@ -18,7 +18,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUARD_TEST_PATH = Path(__file__).resolve()
 
-# Parked experiment zone — see src/paddle_models/PARKED.md.
+# Retired experiment zone — these modules must not be re-imported.
 FORBIDDEN_PREFIXES = (
     "paddle_models.application",
     "paddle_models.core",
@@ -158,7 +158,7 @@ def _format(violations):
         f"  {path}:{lineno}: forbidden import of '{module}'"
         for path, lineno, module in sorted(violations)
     ]
-    return "Parked architecture import(s) detected:\n" + "\n".join(lines)
+    return "Retired architecture import(s) detected:\n" + "\n".join(lines)
 
 
 def _imported_modules(path: Path):
@@ -175,23 +175,23 @@ def _imported_modules(path: Path):
     return modules
 
 
-class TestActivePathHasNoParkedImports(unittest.TestCase):
+class TestActivePathHasNoRetiredImports(unittest.TestCase):
     def test_active_scope_is_nonempty(self):
         # Functional presence guard (not a fixed file count): the CLI entry must be scanned.
         self.assertIn(REPO_ROOT / "src/paddle_models/cli/main.py", _active_files())
 
-    def test_active_path_imports_no_parked_package(self):
+    def test_active_path_imports_no_retired_package(self):
         violations = []
         for path in _active_files():
             violations.extend(_scan_file(path))
         self.assertEqual(violations, [], _format(violations))
 
 
-class TestTestsHaveNoParkedImports(unittest.TestCase):
+class TestTestsHaveNoRetiredImports(unittest.TestCase):
     def test_test_tree_is_nonempty(self):
         self.assertTrue(_test_files())
 
-    def test_test_tree_imports_no_parked_package(self):
+    def test_test_tree_imports_no_retired_package(self):
         violations = []
         for path in _test_files():
             violations.extend(_scan_file(path))
@@ -213,9 +213,9 @@ class TestCliEntrypointWiring(unittest.TestCase):
             f"(imports: {sorted(self.modules)})",
         )
 
-    def test_cli_does_not_reference_parked_build_document(self):
+    def test_cli_does_not_reference_retired_build_document(self):
         offenders = [m for m in self.modules if "build_document" in m]
-        self.assertEqual(offenders, [], f"parked build_document referenced: {offenders}")
+        self.assertEqual(offenders, [], f"retired build_document referenced: {offenders}")
         self.assertFalse(any(m.startswith("paddle_models.application") for m in self.modules))
 
 

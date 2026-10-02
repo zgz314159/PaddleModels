@@ -18,34 +18,25 @@ def check_schema_v2():
         return False
     return True
 
-def check_src_layout():
-    src_path = Path("src/paddle_models")
-    if not src_path.exists():
-        print(f"[ERROR] src/paddle_models layout not found.")
-        return False
-    
+def check_active_entrypoints():
     required_paths = [
-        "cli/main.py",
-        "domain/models.py",
-        "infrastructure/pdf/ocr_adapters",
-        "infrastructure/pdf/table_adapters",
-        "infrastructure/storage/kb_exporter.py"
+        "src/paddle_models/cli/main.py",
+        "pipeline/v2_runner.py"
     ]
+    ok = True
     for p in required_paths:
-        full_path = src_path / p
-        if not full_path.exists():
-            print(f"[WARNING] Missing component: {p}")
+        if not Path(p).exists():
+            print(f"[ERROR] Missing active entrypoint: {p}")
+            ok = False
         else:
-            print(f"[OK] Found component: {p}")
-    
-    print("[SUCCESS] src/paddle_models layout verified.")
-    return True
+            print(f"[OK] Found active entrypoint: {p}")
+    return ok
 
 def main():
     print("=== PaddleModels Project Integrity Check ===")
     all_ok = True
     all_ok &= check_schema_v2()
-    all_ok &= check_src_layout()
+    all_ok &= check_active_entrypoints()
     
     if all_ok:
         print("=== ALL CHECKS PASSED ===")
