@@ -27,11 +27,16 @@ class NativeAdapter:
         self._dynamic_artifacts: Set[str] = set()
         self._initialized = False
 
+    def _ensure_doc(self):
+        """Open the PDF handle lazily without running full-document scans."""
+        if not self.doc:
+            self.doc = fitz.open(self.context.input_path)
+        return self.doc
+
     def _ensure_initialized(self):
         if self._initialized:
             return
-        if not self.doc:
-            self.doc = fitz.open(self.context.input_path)
+        self.doc = self._ensure_doc()
         
         # Collect artifacts (watermarks and dynamic headers/footers)
         self._watermarks = collect_repeated_watermark_candidates(self.doc)
@@ -208,6 +213,27 @@ class NativeAdapter:
         except Exception as e:
             print(f"Error extracting page {page_number}: {e}")
             return DocPage(page_number=page_number, width=0, height=0, method="error")
+
+    def probe_page_native_chars(self, page_number: int) -> int:
+        """Cheap, read-only per-page native-text probe used for routing only.
+
+        Counts non-whitespace characters returned by a plain text read of a
+        single page. It deliberately does NOT run the artifact scan, full
+        block extraction, rendering, OCR, or any model inference, so routing
+        never repeats expensive per-page work.
+
+        Raises ValueError for out-of-range pages; underlying fitz errors from
+        loading the page / reading its text propagate to the caller.
+        """
+        doc = self._ensure_doc()
+        page_count = doc.page_count
+        if page_number < 1 or page_number > page_count:
+            raise ValueError(
+                f"page {page_number} out of range (1..{page_count})"
+            )
+        page = doc.load_page(page_number - 1)
+        text = page.get_text("text") or ""
+        return len(re.sub(r"\s+", "", text))
 
     def probe_coverage(self) -> float:
         """Returns the ratio of pages with native text."""
