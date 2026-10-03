@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from utils.fs_paths import fs_path
+
 # BuildProfile fields that can change the extracted page IR. Only these are
 # folded into the page-cache fingerprint; identity/projection-only fields
 # (name, grouping_strategy) are intentionally excluded.
@@ -100,7 +102,13 @@ class RunContext:
     def get_cache_dir(self) -> Path:
         cache_root = Path(os.environ.get("PADDLE_CACHE_ROOT", ".cache"))
         run_cache = cache_root / self.get_input_sha256() / self.profile.name
-        run_cache.mkdir(parents=True, exist_ok=True)
+        try:
+            # fs_path lifts the Windows MAX_PATH limit; a cache location the OS
+            # still rejects (permissions/not-a-directory) must not fail the run —
+            # PageCache warns once and degrades to an uncached run.
+            os.makedirs(fs_path(run_cache), exist_ok=True)
+        except OSError:
+            pass
         return run_cache
 
     def elapsed_time(self) -> float:
