@@ -44,6 +44,20 @@ The KB and Canonical IR are validated at runtime against
 installed `contracts` package (`importlib.resources`), with a source-checkout
 fallback — never via a hard-coded repository path.
 
+## Page cache
+
+`v2` caches per-page Canonical IR under `PADDLE_CACHE_ROOT` (default `.cache`),
+keyed by the full input SHA-256 and a configuration fingerprint. On Windows the
+cache is addressed with the extended-length (`\\?\`) form, so a deep cache root
+works even beyond the legacy 260-character `MAX_PATH` limit. The path shape is
+`<root>/<64-char input SHA>/<profile>/pages_v2/page_N.<strategy>.json`, written
+atomically (same-directory temp file + replace).
+
+If the cache location cannot be used at all (permissions, a file in the path,
+...) `v2` prints **one** warning and continues without a cache; this is never
+treated as an extraction failure and never reported as a cache hit. Outputs still
+go to `--out`; the cache never writes into the installed package.
+
 ## External wheel smoke test
 
 ```bash

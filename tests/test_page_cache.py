@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -31,6 +32,7 @@ from pipeline.page_cache import (  # noqa: E402
     page_ir_from_dict,
 )
 from pipeline.page_router import DEFAULT_MIN_NATIVE_CHARS  # noqa: E402
+from utils.fs_paths import fs_path  # noqa: E402
 
 
 def _block(
@@ -446,6 +448,77 @@ class TestRunnerCacheHit(_TmpDirTestCase):
         self.assertEqual(native.render_calls, 1)
         self.assertTrue((ctx.output_dir / "shots" / "missing_asset.png").exists())
         self.assertEqual(len(doc_ir.pages), 1)
+
+
+def _rmtree_long(path) -> None:
+    """Remove a possibly very long path (Windows extended-length aware)."""
+    shutil.rmtree(fs_path(path), ignore_errors=True)
+
+
+class TestLongPathAndDegradation(_TmpDirTestCase):
+    """Windows long-path addressing + safe uncached degradation."""
+
+    def _deep_cache_dir(self, suffix: str) -> Path:
+        # Short base + several max-length segments so the full cache path
+        # exceeds the Windows MAX_PATH (260) limit.
+        root = Path(tempfile.mkdtemp(prefix="pmdeep_"))
+        self.addCleanup(_rmtree_long, root)
+        deep = root
+        for index in range(5):
+            deep = deep / (f"{index:02d}_" + "x" * 40)
+        return deep / suffix
+
+    def test_short_path_roundtrip_still_hits(self):
+        cache = _cache(self.tmp / "short_cache")
+        cache.store(1, "native", _page(1))
+        self.assertFalse(cache.disabled)
+        self.assertIsNotNone(cache.load(1, "native"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows long-path addressing")
+    def test_deep_cache_dir_writes_and_hits(self):
+        cache = _cache(self._deep_cache_dir("sha") / "default")
+        self.assertGreater(len(str(cache.path_for(1, "native"))), 260)
+        cache.store(1, "native", _page(1))
+        self.assertFalse(cache.disabled, cache.disabled_reason)
+        self.assertTrue(os.path.exists(fs_path(cache.path_for(1, "native"))))
+        # A fresh instance with the same identity hits through the deep path.
+        self.assertIsNotNone(_cache(cache.cache_dir).load(1, "native"))
+        # The atomic write leaves no temp files behind.
+        leftovers = [
+            n for n in os.listdir(fs_path(cache.namespace_dir)) if ".pctmp-" in n
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_unwritable_cache_degrades_once_and_never_fakes_a_hit(self):
+        blocker = self.tmp / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        cache = _cache(blocker / "cache")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cache.store(1, "native", _page(1))
+            self.assertTrue(cache.disabled)
+            self.assertIsNone(cache.load(1, "native"))  # never a fake hit
+            cache.store(2, "native", _page(2))  # no second warning
+        self.assertEqual(buf.getvalue().count("[WARN]"), 1)
+        self.assertIn("without cache", buf.getvalue())
+
+    def test_get_cache_dir_tolerates_uncreatable_root(self):
+        blocker = self.tmp / "blocker2"
+        blocker.write_text("not a directory", encoding="utf-8")
+        pdf = self.tmp / "input.pdf"
+        pdf.write_bytes(b"%PDF-synthetic")
+        run = RunContext(
+            run_id="r",
+            input_path=pdf,
+            output_dir=self.tmp / "out",
+            profile=_profile(),
+            start_time=1.0,
+        )
+        with mock.patch.dict(
+            os.environ, {"PADDLE_CACHE_ROOT": str(blocker / "cache")}
+        ):
+            path = run.get_cache_dir()  # must not raise
+        self.assertEqual(path.name, run.profile.name)
 
 
 if __name__ == "__main__":

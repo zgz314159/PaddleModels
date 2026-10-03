@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from pipeline.canonical_ir import BBox, DocBlock, DocPage
+from utils.fs_paths import fs_path
 
 # Explicit on-disk cache contract version. Bump when the envelope layout
 # changes so older files can never be mistaken for current ones.
@@ -127,10 +128,28 @@ class PageCache:
         self.schema_version = schema_version
         self.namespace = namespace
         self._fingerprints: Dict[str, str] = {}
+        self._disabled = False
+        self.disabled_reason: Optional[str] = None
 
     @property
     def namespace_dir(self) -> Path:
         return self.cache_dir / self.namespace
+
+    @property
+    def disabled(self) -> bool:
+        """True when the cache location is unusable and this run runs uncached."""
+        return self._disabled
+
+    def _disable(self, exc: BaseException) -> None:
+        """Warn once and degrade to an uncached run; never raise for cache I/O."""
+        if self._disabled:
+            return
+        self._disabled = True
+        self.disabled_reason = f"{type(exc).__name__}: {exc}"
+        _warn(
+            "page cache unavailable "
+            f"({self.disabled_reason}); continuing without cache for this run"
+        )
 
     def fingerprint_for(self, strategy: str) -> str:
         fp = self._fingerprints.get(strategy)
@@ -149,13 +168,20 @@ class PageCache:
 
     def load(self, page_number: int, strategy: str) -> Optional[DocPage]:
         """Return the cached DocPage, or None on any mismatch/corruption."""
-        path = self.path_for(page_number, strategy)
-        if not path.exists():
+        if self._disabled:
             return None
+        path = self.path_for(page_number, strategy)
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            if not os.path.exists(fs_path(path)):
+                return None
+            with open(fs_path(path), "r", encoding="utf-8") as f:
                 envelope = json.load(f)
-        except (OSError, ValueError, UnicodeDecodeError) as exc:
+        except OSError as exc:
+            # Location-level failure (permissions, not a directory, ...): degrade
+            # once instead of warning again for every page.
+            self._disable(exc)
+            return None
+        except (ValueError, UnicodeDecodeError) as exc:
             _warn(f"page {page_number}: unreadable page cache {path.name}: {exc}")
             return None
 
@@ -197,9 +223,16 @@ class PageCache:
         return None
 
     def store(self, page_number: int, strategy: str, page_ir: DocPage) -> Path:
-        """Atomically write the envelope so no half-written file is ever read."""
-        self.namespace_dir.mkdir(parents=True, exist_ok=True)
+        """Atomically write the envelope so no half-written file is ever read.
+
+        All filesystem calls address the path through :func:`utils.fs_paths.fs_path`
+        so a deep (Windows long-path) cache root works identically to a short one.
+        A location the OS still rejects disables the cache for this run after a
+        single warning; it is never reported as an extraction failure.
+        """
         path = self.path_for(page_number, strategy)
+        if self._disabled:
+            return path
         envelope = {
             "cacheSchemaVersion": self.schema_version,
             "fingerprint": self.fingerprint_for(strategy),
@@ -211,18 +244,30 @@ class PageCache:
         payload = (
             json.dumps(envelope, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
         )
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(self.namespace_dir),
-            prefix=".pctmp-",
-            suffix=".tmp",
-        )
         try:
+            os.makedirs(fs_path(self.namespace_dir), exist_ok=True)
+        except OSError as exc:
+            self._disable(exc)
+            return path
+        tmp_name: Optional[str] = None
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=fs_path(self.namespace_dir),
+                prefix=".pctmp-",
+                suffix=".tmp",
+            )
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_name, str(path))
+            os.replace(fs_path(tmp_name), fs_path(path))
+        except OSError as exc:
+            self._disable(exc)
         finally:
-            if os.path.exists(tmp_name):
-                os.remove(tmp_name)
+            if tmp_name is not None:
+                try:
+                    if os.path.exists(fs_path(tmp_name)):
+                        os.remove(fs_path(tmp_name))
+                except OSError:
+                    pass
         return path
