@@ -27,6 +27,32 @@ dev = [
     "mypy>=1.5.0",
 ]
 
+[project.scripts]
+paddlemodels = "paddle_models.cli.main:main"
+
+# The active runtime code lives in two roots: the CLI under src/ and the
+# pipeline/imaging/models/... packages at the repository root. The wheel must
+# carry both, plus the contract schemas, so `paddlemodels` works from any cwd
+# without a source checkout on sys.path.
+[tool.setuptools]
+package-dir = {"" = "src", "pipeline" = "pipeline", "imaging" = "imaging", "models" = "models", "utils" = "utils", "classification" = "classification", "contracts" = "contracts", "tools" = "tools"}
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = [
+    "paddle_models*",
+    "pipeline*",
+    "imaging*",
+    "models*",
+    "utils*",
+    "classification*",
+    "contracts*",
+    "tools*",
+]
+
+[tool.setuptools.package-data]
+contracts = ["*.json"]
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
