@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest-wheel-smoke:
+    name: pytest + wheel + CLI smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Minimal runtime + test dependencies only. No OCR models, no keys and no
+      # repository-external sample PDF are required: tests that need the 158-page
+      # sample (or a real tesseract binary) skip when it is absent.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install pytest
+          python -m pip install \
+            "PyMuPDF>=1.23" "Pillow>=10" "numpy>=1.24" \
+            "opencv-python>=4.8" "jsonschema>=4.18" \
+            "python-docx>=1.0" "requests>=2.31"
+
+      - name: Full pytest suite
+        run: python -m pytest -q -rs
+
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --no-build-isolation -w dist .
+
+      - name: Install wheel into an isolated target
+        run: python -m pip install --no-deps --target "$RUNNER_TEMP/pmsite" dist/paddle_models-*.whl
+
+      # Install/entry smoke run from OUTSIDE the repository, using the installed
+      # wheel (not the source checkout). This is deliberately NOT the real
+      # 158-page acceptance run, which is a local, non-committed gate.
+      - name: CLI install/entry smoke (from outside the repo)
+        working-directory: ${{ runner.temp }}
+        env:
+          PYTHONPATH: ${{ runner.temp }}/pmsite
+          PADDLE_CACHE_ROOT: ${{ runner.temp }}/pmsite-cache
+        run: |
+          python -m paddle_models.cli.main --help
+          python - <<'PY'
+          import paddle_models.cli.main as m
+          print("installed entry import ok:", m.__file__)
+          assert "pmsite" in m.__file__, m.__file__
+          PY
+
+      - name: Scope note
+        run: |
+          echo "CI covers: full pytest + wheel build + installed-wheel CLI smoke."
+          echo "Not covered here: the 158-page real-PDF acceptance (local only)."

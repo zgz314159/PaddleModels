@@ -965,6 +965,45 @@ def check_figure_caption_ocr_metrics(
     return errors
 
 
+def check_v2_referenced_assets(
+    kb: Optional[Dict[str, Any]],
+    output_dir: Path,
+) -> List[str]:
+    """Contract-required asset presence for a v2 KB (degradation stays allowed).
+
+    Only a block that *claims* a deliverable local asset — a non-empty relative
+    ``imageUri``/``src`` whose file is absent under the run directory — is an
+    inconsistency. Blocks that mark an asset missing/degraded (empty uri,
+    assetStatus="missing", cropWarnings) and non-local URIs (absolute paths,
+    URLs) are the sanctioned degradation and are never turned into a failure.
+    """
+    if not isinstance(kb, dict):
+        return ["knowledge_base unavailable for referenced-asset check"]
+    base = Path(output_dir)
+    errors: List[str] = []
+    seen: Set[str] = set()
+    for entry in kb.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        for block in entry.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            uri = block.get("imageUri") or block.get("src") or ""
+            if not isinstance(uri, str) or not uri.strip():
+                continue
+            uri = uri.strip()
+            if "://" in uri or Path(uri).is_absolute():
+                continue
+            if uri in seen:
+                continue
+            seen.add(uri)
+            if not (base / uri).is_file():
+                errors.append(
+                    f"missing referenced asset: {uri} (block {block.get('id')})"
+                )
+    return errors
+
+
 def run_v2(
     run_dir: Path,
     input_path: Path,
@@ -977,9 +1016,14 @@ def run_v2(
     """Run pipeline.v2_runner.run_v2 into outputs/runs/<id>/v2/."""
     v2_dir = run_dir / "v2"
     v2_dir.mkdir(parents=True, exist_ok=True)
+    # Bound here so the publication boundary stays safe if the (lazy) pipeline
+    # import itself fails; the pipeline import block rebinds them.
+    v2_staged_paths = None
+    publish_staged_outputs = None
+    discard_staged_outputs = None
     result: Dict[str, Any] = {
         "status": "failed",
-        "outputs": {"dir": str(v2_dir)},
+        "outputs": {"dir": str(v2_dir), "published": False},
         "metrics": None,
         "elapsed_ms": 0,
         "errors": [],
@@ -992,6 +1036,23 @@ def run_v2(
             "capability": None,
         },
     }
+
+    # Refuse to reuse a run directory that already holds a published deliverable.
+    # Checked before anything is written, this protects the whole previous set
+    # (KB, IR and shots). A first failure publishes no KB, so a same-directory
+    # retry is still allowed.
+    try:
+        from pipeline.v2_runner import published_kb_path
+
+        published_kb = published_kb_path(v2_dir)
+    except Exception:
+        published_kb = v2_dir / "knowledge_base.json"
+    if published_kb.exists():
+        result["errors"].append(
+            "refusing to run: run directory already contains a published "
+            f"{published_kb.name}; move or remove it before rerunning"
+        )
+        return result
 
     missing = missing_hard_deps("v2", caps)
     if missing:
@@ -1039,7 +1100,12 @@ def run_v2(
     started = time.time()
     try:
         from models.run_context import BuildProfile, RunContext
-        from pipeline.v2_runner import run_v2 as pipeline_run_v2
+        from pipeline.v2_runner import (
+            discard_staged_outputs,
+            publish_staged_outputs,
+            run_v2 as pipeline_run_v2,
+            v2_staged_paths,
+        )
 
         build_profile = BuildProfile()
         build_profile.name = profile
@@ -1059,21 +1125,24 @@ def run_v2(
             page_range = f"{start}-{end}"
         else:
             page_range = str(start) if start > 1 else None
-        _, kb_final = pipeline_run_v2(ctx, page_range)
+        # Defer publication: the pipeline stages IR + KB; the CLI validates and
+        # only then publishes (see the publication boundary at the end).
+        _, kb_final = pipeline_run_v2(ctx, page_range, publish=False)
 
-        kb_path = v2_dir / "knowledge_base.json"
-        ir_path = v2_dir / "knowledge_base.v2.json"
+        staged_kb, staged_ir = v2_staged_paths(v2_dir)
         result["elapsed_ms"] = int((time.time() - started) * 1000)
-        result["outputs"]["knowledge_base"] = str(kb_path)
-        if ir_path.exists():
-            result["outputs"]["canonical_ir"] = str(ir_path)
+        # Validation and metrics read the staged artifacts; nothing is published
+        # until every gate below passes.
+        result["outputs"]["knowledge_base"] = str(staged_kb)
+        if staged_ir.exists():
+            result["outputs"]["canonical_ir"] = str(staged_ir)
         fc_report_path = v2_dir / "figure_caption_ocr.json"
         if fc_report_path.exists():
             result["outputs"]["figure_caption_ocr"] = str(fc_report_path)
         fr_report_path = v2_dir / "figure_reference_index.json"
         if fr_report_path.exists():
             result["outputs"]["figure_reference_index"] = str(fr_report_path)
-        result["metrics"] = kb_metrics(kb_path)
+        result["metrics"] = kb_metrics(staged_kb)
         if result["metrics"] is None and kb_final is not None:
             result["metrics"] = kb_metrics_from_obj(kb_final)
 
@@ -1137,7 +1206,17 @@ def run_v2(
             for ge in fr_gate_errors:
                 result["errors"].append(f"figure_reference: {ge}")
 
-        if ocr_metric_gate_failed or fr_metric_gate_failed:
+        # Referenced-asset gate: a block that claims a deliverable local asset
+        # must have that file present. Marked-missing/degraded assets stay valid.
+        asset_gate_failed = False
+        if kb_final is not None:
+            asset_errors = check_v2_referenced_assets(kb_final, v2_dir)
+            if asset_errors:
+                asset_gate_failed = True
+                for ae in asset_errors:
+                    result["errors"].append(f"v2 assets: {ae}")
+
+        if ocr_metric_gate_failed or fr_metric_gate_failed or asset_gate_failed:
             result["status"] = "failed"
         else:
             result["status"] = "ok" if result["metrics"] is not None else "failed"
@@ -1164,6 +1243,43 @@ def run_v2(
             result["warnings"].append("traceback_tail: " + " | ".join(tb[-5:]))
 
     apply_contract_validation(result, side="v2")
+
+    # Publication boundary. Only a run whose schema/report gates all passed may
+    # expose the deliverable KB + IR. A failed run discards its staged copies
+    # and never reports a knowledge_base output; a previously published pair is
+    # left untouched.
+    if publish_staged_outputs is None or discard_staged_outputs is None:
+        # The pipeline never imported, so nothing was staged; there is no
+        # deliverable to publish.
+        result["outputs"].pop("knowledge_base", None)
+        result["outputs"].pop("canonical_ir", None)
+        result["outputs"]["published"] = False
+    elif result.get("status") == "ok":
+        try:
+            final_kb, final_ir = publish_staged_outputs(v2_dir)
+        except Exception as pub_e:
+            # A rename failure must never be reported as success.
+            discard_staged_outputs(v2_dir)
+            result["status"] = "failed"
+            result["errors"].append(
+                f"publication failed: {type(pub_e).__name__}: {pub_e}"
+            )
+            result["outputs"].pop("knowledge_base", None)
+            result["outputs"].pop("canonical_ir", None)
+            result["outputs"]["published"] = False
+        else:
+            result["outputs"]["knowledge_base"] = str(final_kb)
+            if final_ir.exists():
+                result["outputs"]["canonical_ir"] = str(final_ir)
+            else:
+                result["outputs"].pop("canonical_ir", None)
+            result["outputs"]["published"] = True
+    else:
+        discard_staged_outputs(v2_dir)
+        result["outputs"].pop("knowledge_base", None)
+        result["outputs"].pop("canonical_ir", None)
+        result["outputs"]["published"] = False
+
     return result
 
 

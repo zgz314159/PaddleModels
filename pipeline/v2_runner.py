@@ -3,6 +3,7 @@ import sys
 import os
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 from models.run_context import RunContext, BuildProfile
@@ -19,6 +20,7 @@ from pipeline.canonical_ir import CanonicalIR
 from imaging.bbox_utils import bbox_overlap_ratio_xywh
 from pipeline.page_router import DEFAULT_MIN_NATIVE_CHARS, PageRouter
 from pipeline.page_cache import PageCache
+from utils.fs_paths import fs_path
 
 try:
     import jsonschema
@@ -26,6 +28,132 @@ try:
 except ImportError:
     jsonschema = None
     HAS_JSONSCHEMA = False
+
+# --- v2 output publication -------------------------------------------------
+# The final KB is a deliverable. It is written to a same-directory staging area
+# and only atomically renamed into place once every caller-side gate has passed.
+# A failed or interrupted run therefore never leaves a file at the deliverable
+# path, and a previously published pair is never touched by a failing run.
+V2_KB_FILENAME = "knowledge_base.json"
+V2_IR_FILENAME = "knowledge_base.v2.json"
+V2_STAGING_DIRNAME = ".staging"
+
+
+def v2_output_paths(output_dir) -> Tuple[Path, Path]:
+    """Return the (final_kb, final_ir) deliverable paths for a v2 run dir."""
+    output_dir = Path(output_dir)
+    return output_dir / V2_KB_FILENAME, output_dir / V2_IR_FILENAME
+
+
+def v2_staged_paths(output_dir) -> Tuple[Path, Path]:
+    """Return the (staged_kb, staged_ir) paths inside the run's staging area."""
+    staging = Path(output_dir) / V2_STAGING_DIRNAME
+    return staging / V2_KB_FILENAME, staging / V2_IR_FILENAME
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Serialize ``payload`` to ``path`` via a same-directory temp + atomic rename.
+
+    All filesystem calls address the path through :func:`utils.fs_paths.fs_path`
+    so a deep (Windows long-path) run directory works the same as a short one.
+    On any failure the temp file is removed and nothing is left at ``path``.
+    """
+    path = Path(path)
+    os.makedirs(fs_path(path.parent), exist_ok=True)
+    tmp_name: Optional[str] = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=fs_path(path.parent), prefix=".v2tmp-", suffix=".json"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(fs_path(tmp_name), fs_path(path))
+    except BaseException:
+        if tmp_name is not None:
+            try:
+                if os.path.exists(fs_path(tmp_name)):
+                    os.remove(fs_path(tmp_name))
+            except OSError:
+                pass
+        raise
+
+
+def write_staged_outputs(
+    output_dir, doc_ir: CanonicalIR, kb_final: Dict[str, Any]
+) -> Tuple[Path, Path]:
+    """Atomically write IR + KB into the run directory's staging area."""
+    staged_kb, staged_ir = v2_staged_paths(output_dir)
+    try:
+        _atomic_write_json(staged_ir, doc_ir.to_dict())
+        _atomic_write_json(staged_kb, kb_final)
+    except BaseException:
+        discard_staged_outputs(output_dir)
+        raise
+    return staged_kb, staged_ir
+
+
+def published_kb_path(output_dir) -> Path:
+    """Path of the published deliverable whose presence marks a run dir as used."""
+    output_dir = Path(output_dir)
+    return output_dir / V2_KB_FILENAME
+
+
+def publish_staged_outputs(output_dir) -> Tuple[Path, Path]:
+    """Atomically rename staged IR + KB into their final deliverable paths.
+
+    Publication is all-or-nothing across the pair and never overwrites an
+    already-published KB:
+
+    * both staged files are required — a partially staged run is an error, never
+      a silent success;
+    * a run directory that already holds a published ``knowledge_base.json`` is
+      refused, so an old deliverable can never be replaced or paired with a new
+      IR;
+    * on any rename failure the files moved by this call are removed, so no
+      half-published pair is left behind.
+
+    The KB rename is the commit point and happens last.
+    """
+    final_kb, final_ir = v2_output_paths(output_dir)
+    staged_kb, staged_ir = v2_staged_paths(output_dir)
+    if not (os.path.exists(fs_path(staged_ir)) and os.path.exists(fs_path(staged_kb))):
+        raise FileNotFoundError(
+            "staged outputs incomplete: both IR and KB are required to publish"
+        )
+    if os.path.exists(fs_path(final_kb)):
+        raise FileExistsError(
+            f"refusing to overwrite published deliverable: {final_kb}"
+        )
+    moved: List[Path] = []
+    try:
+        os.replace(fs_path(staged_ir), fs_path(final_ir))
+        moved.append(final_ir)
+        os.replace(fs_path(staged_kb), fs_path(final_kb))
+        moved.append(final_kb)
+    except BaseException:
+        # Roll back so a failed publish leaves neither a mixed pair nor orphans.
+        for path in moved:
+            try:
+                if os.path.exists(fs_path(path)):
+                    os.remove(fs_path(path))
+            except OSError:
+                pass
+        raise
+    return final_kb, final_ir
+
+
+def discard_staged_outputs(output_dir) -> None:
+    """Remove only this run's staged outputs; never touches final artifacts."""
+    staged_kb, staged_ir = v2_staged_paths(output_dir)
+    for path in (staged_kb, staged_ir):
+        try:
+            if os.path.exists(fs_path(path)):
+                os.remove(fs_path(path))
+        except OSError:
+            pass
+
 
 def main():
     parser = argparse.ArgumentParser(description="PaddleModels v2 Pipeline Runner")
@@ -59,7 +187,12 @@ def main():
     if args.mode == "shadow" and kb_v2:
         run_shadow_compare(ctx, kb_v2)
 
-def run_v2(ctx: RunContext, page_range_str: Optional[str] = None):
+def run_v2(
+    ctx: RunContext,
+    page_range_str: Optional[str] = None,
+    *,
+    publish: bool = True,
+):
     print("Running v2 extraction...")
     
     # Cache and Router
@@ -403,16 +536,17 @@ def run_v2(ctx: RunContext, page_range_str: Optional[str] = None):
     )
     kb_final = projector.project(doc_ir)
     
-    # Save outputs
-    ir_output_path = ctx.output_dir / "knowledge_base.v2.json"
-    kb_output_path = ctx.output_dir / "knowledge_base.json"
-    with open(ir_output_path, "w", encoding="utf-8") as f:
-        json.dump(doc_ir.to_dict(), f, indent=2, ensure_ascii=False)
-    with open(kb_output_path, "w", encoding="utf-8") as f:
-        json.dump(kb_final, f, indent=2, ensure_ascii=False)
-        
-    print(f"IR output saved to {ir_output_path}")
-    print(f"KB output saved to {kb_output_path}")
+    # Stage outputs. When this runner owns the publication boundary
+    # (publish=True) it publishes atomically here; the CLI passes publish=False
+    # so it can publish only after its schema/report gates pass.
+    staged_kb, staged_ir = write_staged_outputs(ctx.output_dir, doc_ir, kb_final)
+    if publish:
+        kb_output_path, ir_output_path = publish_staged_outputs(ctx.output_dir)
+        print(f"IR output saved to {ir_output_path}")
+        print(f"KB output saved to {kb_output_path}")
+    else:
+        print(f"IR staged at {staged_ir}")
+        print(f"KB staged at {staged_kb}")
     print("Done v2 extraction.")
     return doc_ir, kb_final
 
