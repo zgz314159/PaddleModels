@@ -1781,9 +1781,10 @@ class TestMetricsGate(unittest.TestCase):
             "missing": [],
         }
 
-        def fake_pipeline(ctx, page_range):
+        def fake_pipeline(ctx, page_range=None, *, publish=True):
             from pipeline.canonical_ir import BBox, CanonicalIR, DocBlock, DocPage
             from pipeline.semantic_projector import SemanticProjector
+            from pipeline.v2_runner import write_staged_outputs
 
             ir = CanonicalIR(document_id="d", sha256="0" * 64)
             page = DocPage(page_number=1, width=100.0, height=100.0)
@@ -1836,8 +1837,9 @@ class TestMetricsGate(unittest.TestCase):
             kb = SemanticProjector("d", strategy="page").project(ir)
             v2_dir = ctx.output_dir
             v2_dir.mkdir(parents=True, exist_ok=True)
-            with open(v2_dir / "knowledge_base.json", "w", encoding="utf-8") as f:
-                json.dump(kb, f, ensure_ascii=False)
+            # Stage IR + KB the way the real runner does; the CLI publishes them
+            # only if its gates pass (here they must not).
+            write_staged_outputs(v2_dir, ir, kb)
             # Report claims 4 linked / 4 figures — KB has 3.
             report = {
                 "engine": "tesseract",
