@@ -94,19 +94,53 @@ def write_staged_outputs(
     return staged_kb, staged_ir
 
 
+def published_kb_path(output_dir) -> Path:
+    """Path of the published deliverable whose presence marks a run dir as used."""
+    output_dir = Path(output_dir)
+    return output_dir / V2_KB_FILENAME
+
+
 def publish_staged_outputs(output_dir) -> Tuple[Path, Path]:
     """Atomically rename staged IR + KB into their final deliverable paths.
 
-    The KB rename is the commit point and is performed last, so an interruption
-    between the two renames still leaves no deliverable KB. Missing staged files
-    are skipped.
+    Publication is all-or-nothing across the pair and never overwrites an
+    already-published KB:
+
+    * both staged files are required — a partially staged run is an error, never
+      a silent success;
+    * a run directory that already holds a published ``knowledge_base.json`` is
+      refused, so an old deliverable can never be replaced or paired with a new
+      IR;
+    * on any rename failure the files moved by this call are removed, so no
+      half-published pair is left behind.
+
+    The KB rename is the commit point and happens last.
     """
     final_kb, final_ir = v2_output_paths(output_dir)
     staged_kb, staged_ir = v2_staged_paths(output_dir)
-    if os.path.exists(fs_path(staged_ir)):
+    if not (os.path.exists(fs_path(staged_ir)) and os.path.exists(fs_path(staged_kb))):
+        raise FileNotFoundError(
+            "staged outputs incomplete: both IR and KB are required to publish"
+        )
+    if os.path.exists(fs_path(final_kb)):
+        raise FileExistsError(
+            f"refusing to overwrite published deliverable: {final_kb}"
+        )
+    moved: List[Path] = []
+    try:
         os.replace(fs_path(staged_ir), fs_path(final_ir))
-    if os.path.exists(fs_path(staged_kb)):
+        moved.append(final_ir)
         os.replace(fs_path(staged_kb), fs_path(final_kb))
+        moved.append(final_kb)
+    except BaseException:
+        # Roll back so a failed publish leaves neither a mixed pair nor orphans.
+        for path in moved:
+            try:
+                if os.path.exists(fs_path(path)):
+                    os.remove(fs_path(path))
+            except OSError:
+                pass
+        raise
     return final_kb, final_ir
 
 

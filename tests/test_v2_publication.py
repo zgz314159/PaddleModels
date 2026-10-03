@@ -23,6 +23,7 @@ import types
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -285,6 +286,112 @@ class _CliV2TestCase(unittest.TestCase):
         self.assertTrue(self.final_kb().is_file())
         self.assertEqual(self.run_report()["status"], "ok")
 
+    # -- published-output protection --------------------------------------
+    def _seed_published_outputs(self, shot="shots/ok.png"):
+        """Create a complete old deliverable set: KB + IR + the same-named shot."""
+        shot_path = self.v2_dir / shot
+        shot_path.parent.mkdir(parents=True, exist_ok=True)
+        shot_path.write_bytes(b"OLD-SHOT")
+        self.final_kb().write_bytes(b"OLD-KB")
+        self.final_ir().write_bytes(b"OLD-IR")
+        return shot_path
+
+    def _arm_pipeline_must_not_run(self):
+        ran = {"pipeline": False}
+
+        def _boom(ctx, page_range=None, *, publish=True):
+            ran["pipeline"] = True
+            raise AssertionError("pipeline must not run for a published run dir")
+
+        vr.run_v2 = _boom
+        return ran
+
+    def _assert_old_set_intact(self, shot_path, ran):
+        self.assertEqual(self.final_kb().read_bytes(), b"OLD-KB")
+        self.assertEqual(self.final_ir().read_bytes(), b"OLD-IR")
+        self.assertEqual(shot_path.read_bytes(), b"OLD-SHOT")
+        self.assertFalse(ran["pipeline"], "pipeline must not have run")
+        self.assertEqual(self.staging_files(), [])
+        rep = self.run_report()
+        self.assertEqual(rep["status"], "failed")
+        v2_out = rep["outputs"]["v2"]
+        self.assertFalse(v2_out["published"])
+        self.assertNotIn("knowledge_base", v2_out)
+        self.assertNotIn("canonical_ir", v2_out)
+        self.assertIn(
+            "already contains a published", " ".join(rep.get("errors") or [])
+        )
+
+    def test_published_rerun_publish_rename_failure_preserves_old_set(self):
+        shot_path = self._seed_published_outputs()
+        ran = self._arm_pipeline_must_not_run()
+        real_replace = os.replace
+        state = {"replace": 0}
+
+        def _failing_replace(src, dst, *a, **k):
+            state["replace"] += 1
+            if str(dst).replace("\\\\?\\", "").endswith("knowledge_base.json"):
+                raise OSError("injected publish KB rename failure")
+            return real_replace(src, dst, *a, **k)
+
+        with mock.patch.object(vr.os, "replace", _failing_replace):
+            rc = self.run_cli()
+        self.assertEqual(rc, 1)
+        self.assertEqual(state["replace"], 0, "guard must trip before any rename")
+        self._assert_old_set_intact(shot_path, ran)
+
+    def test_published_rerun_schema_failure_preserves_old_set(self):
+        shot_path = self._seed_published_outputs()
+        ran = self._arm_pipeline_must_not_run()
+        state = {"validate": 0}
+
+        def _spy_validate(*a, **k):
+            state["validate"] += 1
+            return {"status": "invalid", "schema": "injected", "errors": ["injected"]}
+
+        cli.validate_against_schema = _spy_validate
+        rc = self.run_cli()
+        self.assertEqual(rc, 1)
+        self.assertEqual(state["validate"], 0, "guard must trip before validation")
+        self._assert_old_set_intact(shot_path, ran)
+
+    def _install_partial_pipeline(self, *, drop):
+        kb = _minimal_kb()
+
+        def _fake(ctx, page_range=None, *, publish=True):
+            out = Path(ctx.output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "figure_reference_index.json").write_text(
+                json.dumps({"stats": {}}), encoding="utf-8"
+            )
+            vr.write_staged_outputs(out, _DocIRStub(), kb)
+            staged_kb, staged_ir = vr.v2_staged_paths(out)
+            (staged_kb if drop == "knowledge_base.json" else staged_ir).unlink()
+            return None, kb
+
+        vr.run_v2 = _fake
+
+    def test_missing_staged_kb_is_not_reported_success(self):
+        self._install_partial_pipeline(drop="knowledge_base.json")
+        rc = self.run_cli()
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.final_kb().exists())
+        rep = self.run_report()
+        self.assertEqual(rep["status"], "failed")
+        self.assertFalse(rep["outputs"]["v2"]["published"])
+        self.assertNotIn("knowledge_base", rep["outputs"]["v2"])
+
+    def test_missing_staged_ir_is_not_reported_success(self):
+        self._install_partial_pipeline(drop="knowledge_base.v2.json")
+        rc = self.run_cli()
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.final_kb().exists())
+        self.assertFalse(self.final_ir().exists())
+        rep = self.run_report()
+        self.assertEqual(rep["status"], "failed")
+        self.assertFalse(rep["outputs"]["v2"]["published"])
+        self.assertIn("staged outputs incomplete", " ".join(rep.get("errors") or []))
+
 
 class TestReferencedAssetCheck(unittest.TestCase):
     """Pure unit coverage of the contract-required asset gate."""
@@ -378,6 +485,44 @@ class TestStagedHelpers(unittest.TestCase):
         self.assertTrue(final_ir.is_file())
         self.assertFalse(staged_kb.exists())
         self.assertFalse(staged_ir.exists())
+
+    def test_publish_refuses_to_overwrite_published_kb(self):
+        final_kb, final_ir = vr.v2_output_paths(self.dir)
+        final_kb.write_bytes(b"OLD-KB")
+        final_ir.write_bytes(b"OLD-IR")
+        vr.write_staged_outputs(self.dir, _DocIRStub(), _minimal_kb())
+        with self.assertRaises(FileExistsError):
+            vr.publish_staged_outputs(self.dir)
+        self.assertEqual(final_kb.read_bytes(), b"OLD-KB")
+        self.assertEqual(final_ir.read_bytes(), b"OLD-IR")
+
+    def test_publish_requires_both_staged_files(self):
+        staged_kb, staged_ir = vr.v2_staged_paths(self.dir)
+        staged_kb.parent.mkdir(parents=True, exist_ok=True)
+        vr._atomic_write_json(staged_ir, _DocIRStub().to_dict())  # IR only, no KB
+        with self.assertRaises(FileNotFoundError):
+            vr.publish_staged_outputs(self.dir)
+        final_kb, final_ir = vr.v2_output_paths(self.dir)
+        self.assertFalse(final_kb.exists())
+        self.assertFalse(final_ir.exists())
+
+    def test_publish_rolls_back_on_rename_failure(self):
+        vr.write_staged_outputs(self.dir, _DocIRStub(), _minimal_kb())
+        real_replace = os.replace
+        state = {"calls": 0}
+
+        def _failing_replace(src, dst, *a, **k):
+            state["calls"] += 1
+            if state["calls"] == 2:  # KB rename (the commit point) fails
+                raise OSError("injected KB rename failure")
+            return real_replace(src, dst, *a, **k)
+
+        with mock.patch.object(vr.os, "replace", _failing_replace):
+            with self.assertRaises(OSError):
+                vr.publish_staged_outputs(self.dir)
+        final_kb, final_ir = vr.v2_output_paths(self.dir)
+        self.assertFalse(final_kb.exists())
+        self.assertFalse(final_ir.exists(), "half-published IR must be rolled back")
 
 
 class TestInstalledWheelExternalRun(unittest.TestCase):

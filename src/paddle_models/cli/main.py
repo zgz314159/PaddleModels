@@ -1037,6 +1037,23 @@ def run_v2(
         },
     }
 
+    # Refuse to reuse a run directory that already holds a published deliverable.
+    # Checked before anything is written, this protects the whole previous set
+    # (KB, IR and shots). A first failure publishes no KB, so a same-directory
+    # retry is still allowed.
+    try:
+        from pipeline.v2_runner import published_kb_path
+
+        published_kb = published_kb_path(v2_dir)
+    except Exception:
+        published_kb = v2_dir / "knowledge_base.json"
+    if published_kb.exists():
+        result["errors"].append(
+            "refusing to run: run directory already contains a published "
+            f"{published_kb.name}; move or remove it before rerunning"
+        )
+        return result
+
     missing = missing_hard_deps("v2", caps)
     if missing:
         result["status"] = "blocked_by_dependency"
