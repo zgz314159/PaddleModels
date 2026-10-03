@@ -21,7 +21,62 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# Source-checkout root (…/<repo>/src/paddle_models/cli/main.py → parents[3]).
+# Installed wheels have no such root: runtime code and contract schemas are
+# resolved from the installed packages instead (see _repo_root/_contracts_dir).
+_SOURCE_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _repo_root() -> Optional[Path]:
+    """Return the source-checkout root when running from a git checkout, else None."""
+    if (_SOURCE_ROOT / "pipeline").is_dir() and (_SOURCE_ROOT / "contracts").is_dir():
+        return _SOURCE_ROOT
+    return None
+
+
+def _contracts_dir() -> Optional[Path]:
+    """Directory holding the packaged contract schemas (installed package or checkout)."""
+    try:
+        import importlib.resources as resources
+
+        candidate = Path(str(resources.files("contracts")))
+        if candidate.is_dir():
+            return candidate
+    except Exception:
+        pass
+    root = _repo_root()
+    if root is not None:
+        candidate = root / "contracts"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _resolve_contract(rel: Path) -> Optional[Path]:
+    """Resolve a contract file by name against the packaged contracts directory."""
+    directory = _contracts_dir()
+    if directory is None:
+        return None
+    candidate = directory / Path(rel).name
+    return candidate if candidate.is_file() else None
+
+
+def _tool_script(name: str) -> Optional[Path]:
+    """Locate a bundled tools/ script (installed package or source checkout)."""
+    try:
+        import importlib.resources as resources
+
+        candidate = Path(str(resources.files("tools").joinpath(name)))
+        if candidate.is_file():
+            return candidate
+    except Exception:
+        pass
+    root = _repo_root()
+    if root is not None:
+        candidate = root / "tools" / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 # Hard deps required to actually execute a PDF mode end-to-end.
 HARD_DEPS: Dict[str, List[str]] = {
@@ -172,7 +227,11 @@ def missing_hard_deps(mode: str, caps: Dict[str, Any]) -> List[str]:
 
 
 def _ensure_repo_on_path() -> None:
-    for p in (str(REPO_ROOT), str(REPO_ROOT / "src")):
+    """Put a source checkout on sys.path; a no-op for installed wheels."""
+    root = _repo_root()
+    if root is None:
+        return
+    for p in (str(root), str(root / "src")):
         if p not in sys.path:
             sys.path.insert(0, p)
 
@@ -572,8 +631,8 @@ def validate_against_schema(
         "schema": str(schema_rel),
         "errors": [],
     }
-    schema_path = REPO_ROOT / schema_rel
-    if not schema_path.exists():
+    schema_path = _resolve_contract(schema_rel)
+    if schema_path is None:
         result["status"] = "missing_schema"
         result["errors"] = [f"schema not found: {schema_rel}"]
         return result
@@ -734,9 +793,19 @@ def run_legacy(
     kb_out = legacy_dir / "knowledge_base.json"
     assets_root = legacy_dir / "assets"
     assets_root.mkdir(parents=True, exist_ok=True)
+    legacy_script = _tool_script("pdf_to_base64_kb.py")
+    if legacy_script is None:
+        result["status"] = "blocked_by_dependency"
+        result["errors"].append(
+            "legacy pipeline script tools/pdf_to_base64_kb.py is not available in this installation"
+        )
+        result["warnings"].append(
+            "legacy/shadow require a source checkout or a wheel that bundles tools/"
+        )
+        return result
     cmd = [
         sys.executable,
-        str(REPO_ROOT / "tools" / "pdf_to_base64_kb.py"),
+        str(legacy_script),
         "--pdf",
         str(input_path),
         "--out",
@@ -749,15 +818,17 @@ def run_legacy(
     if max_pages:
         cmd.extend(["--max-pages", str(max_pages)])
     env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT), str(REPO_ROOT / "src")]
-        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
-    )
+    root = _repo_root()
+    if root is not None:
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(root), str(root / "src")]
+            + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        )
     started = time.time()
     try:
         proc = subprocess.run(
             cmd,
-            cwd=str(REPO_ROOT),
+            cwd=str(root) if root is not None else str(legacy_dir),
             env=env,
             capture_output=True,
             text=True,
