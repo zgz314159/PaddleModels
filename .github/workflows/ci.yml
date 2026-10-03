@@ -33,7 +33,7 @@ jobs:
             "python-docx>=1.0" "requests>=2.31"
 
       - name: Full pytest suite
-        run: python -m pytest -q
+        run: python -m pytest -q -rs
 
       - name: Build wheel
         run: python -m pip wheel --no-deps --no-build-isolation -w dist .
